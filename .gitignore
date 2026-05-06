@@ -1,0 +1,24 @@
+# Go generated
+go.mod
+go.sum
+
+# Build files
+*.bat
+*.exe
+
+# video and audio files
+*.html
+*.ivf
+*.m4a
+*.mp4
+*.opus
+*.h264
+
+# configuration files
+config.json
+
+# Directories
+/logs
+/known_faces
+/pipe
+*/jsfiddle

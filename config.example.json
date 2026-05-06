@@ -1,0 +1,42 @@
+{
+  "signalingServerUrl": "ws://192.168.56.1:3000",
+  "stunServerUrl": "stun:stun.l.google.com:19302",
+  "cameraName": "laptop_cam",
+  "pythonCompiler": "../../face_recog/.venv/Scripts/python",
+  "faceRecogScript": "../face_recog_wrapper.py",
+  "videoWidth": 1920,
+  "videoHeight": 1080,
+  "videoFps": 30,
+  "v4l2Device": "/dev/video0",
+  "iceCredentials": [
+    {
+      "urls": "stun:stun.l.google.com:19302"
+    },
+    {
+      "urls": "stun:stun1.l.google.com:19302"
+    },
+    {
+      "urls": "stun:stun.relay.metered.ca:80"
+    },
+    {
+      "urls": "turn:global.relay.metered.ca:80",
+      "username": "your-metered-username",
+      "credential": "your-metered-credential"
+    },
+    {
+      "urls": "turn:global.relay.metered.ca:80?transport=tcp",
+      "username": "your-metered-username",
+      "credential": "your-metered-credential"
+    },
+    {
+      "urls": "turn:global.relay.metered.ca:443",
+      "username": "your-metered-username",
+      "credential": "your-metered-credential"
+    },
+    {
+      "urls": "turns:global.relay.metered.ca:443?transport=tcp",
+      "username": "your-metered-username",
+      "credential": "your-metered-credential"
+    }
+  ]
+}
