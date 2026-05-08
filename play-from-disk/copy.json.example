@@ -1,0 +1,12 @@
+{
+    "signalingServerUrl": "ws://192.168.56.1:3000",
+    "videoDevice": "Arducam USB Camera",
+    "faceRecogEnabled": true,
+    "faceRecogFormat": "yuv420p",
+    "faceRecogPipe": "face_recog_pipe",
+    "videoCodec": "libvpx",
+    "videoWidth": 1280,
+    "videoHeight": 720,
+    "videoFPS": 30,
+    "videoBitrate": "1M"
+}
