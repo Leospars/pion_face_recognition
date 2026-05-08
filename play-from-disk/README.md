@@ -5,10 +5,21 @@ For an example of playing H264 from disk see [play-from-disk-h264](https://githu
 
 ## Instructions
 ### Create IVF named `output.ivf` that contains a VP8/VP9/AV1 track and/or `output.ogg` that contains a Opus track
-```
+
+**For Video (IVF):**
+```bash
 ffmpeg -i "$INPUT_FILE" -g 30 -b:v 2M output.ivf
-ffmpeg -i "$INPUT_FILE" -vn -c:a libopus -ac 2 -frame_duration 20 -page_duration 20000 -map_metadata -1 output.ogg
 ```
+
+**For Audio (OGG with Opus):**
+```bash
+ffmpeg -i "$INPUT_FILE" -vn -c:a libopus -ac 2 -ar 48000 -page_duration 20000 -map_metadata -1 output.ogg
+```
+
+**Important Audio Requirements:**
+- `-ar 48000`: WebRTC requires 48kHz sample rate for Opus
+- `-page_duration 20000`: Forces 20ms OGG pages (required for WebRTC)
+- `-ac 2`: Stereo audio (recommended for WebRTC)
 
 **Note**: In the `ffmpeg` command which produces the .ivf file, the argument `-b:v 2M` specifies the video bitrate to be 2 megabits per second. We provide this default value to produce decent video quality, but if you experience problems with this configuration (such as dropped frames etc.), you can decrease this. See the [ffmpeg documentation](https://ffmpeg.org/ffmpeg.html#Options) for more information on the format of the value.
 

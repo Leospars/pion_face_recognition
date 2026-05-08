@@ -141,8 +141,22 @@ func main() { //nolint:gocognit,cyclop,gocyclo,maintidx
 			for ; true; <-ticker.C {
 				frame, _, ivfErr := ivf.ParseNextFrame()
 				if errors.Is(ivfErr, io.EOF) {
-					fmt.Printf("\nAll video frames parsed and sent (%d frames in %.1fs)\n", frameCount, time.Since(startTime).Seconds())
-					os.Exit(0)
+					fmt.Printf("\nVideo loop completed (%d frames in %.1fs) - restarting...\n", frameCount, time.Since(startTime).Seconds())
+					// Close current file
+					file.Close()
+					// Reopen file for looping
+					file, ivfErr = os.Open(videoFileName)
+					if ivfErr != nil {
+						panic(ivfErr)
+					}
+					ivf, header, ivfErr = ivfreader.NewWith(file)
+					if ivfErr != nil {
+						panic(ivfErr)
+					}
+					// Reset counters
+					frameCount = 0
+					startTime = time.Now()
+					continue
 				}
 
 				if ivfErr != nil {
@@ -207,18 +221,28 @@ func main() { //nolint:gocognit,cyclop,gocyclo,maintidx
 			// Keep track of last granule, the difference is the amount of samples in the buffer
 			var lastGranule uint64
 
-			// It is important to use a time.Ticker instead of time.Sleep because
-			// * avoids accumulating skew, just calling time.Sleep didn't compensate for the time spent parsing the data
-			// * works around latency issues with Sleep (see https://github.com/golang/go/issues/44343)
-			ticker := time.NewTicker(oggPageDuration)
-			defer ticker.Stop()
 			pageCount := 0
 			audioStartTime := time.Now()
-			for ; true; <-ticker.C {
+			for true {
 				pageData, pageHeader, oggErr := ogg.ParseNextPage()
 				if errors.Is(oggErr, io.EOF) {
-					fmt.Printf("\nAll audio pages parsed and sent (%d pages in %.1fs)\n", pageCount, time.Since(audioStartTime).Seconds())
-					os.Exit(0)
+					fmt.Printf("\nAudio loop completed (%d pages in %.1fs) - restarting...\n", pageCount, time.Since(audioStartTime).Seconds())
+					// Close current file
+					file.Close()
+					// Reopen file for looping
+					file, oggErr = os.Open(audioFileName)
+					if oggErr != nil {
+						panic(oggErr)
+					}
+					ogg, _, oggErr = oggreader.NewWith(file)
+					if oggErr != nil {
+						panic(oggErr)
+					}
+					// Reset counters
+					pageCount = 0
+					audioStartTime = time.Now()
+					lastGranule = 0
+					continue
 				}
 
 				if oggErr != nil {
@@ -232,6 +256,13 @@ func main() { //nolint:gocognit,cyclop,gocyclo,maintidx
 
 				if oggErr = audioTrack.WriteSample(media.Sample{Data: pageData, Duration: sampleDuration}); oggErr != nil {
 					panic(oggErr)
+				}
+
+				// Pace audio by actual page duration to avoid burning through file too fast
+				if sampleDuration > 0 {
+					time.Sleep(sampleDuration)
+				} else {
+					fmt.Printf("Skipping audio page %d with zero duration\n", pageCount)
 				}
 
 				pageCount++

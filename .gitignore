@@ -3,11 +3,10 @@ go.mod
 go.sum
 
 # Build files
-*.bat
 *.exe
 
 # video and audio files
-*.html
+*.ogg
 *.ivf
 *.m4a
 *.mp4
