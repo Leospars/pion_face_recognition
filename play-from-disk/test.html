@@ -228,6 +228,11 @@
 
     <script>
         let pc = null;
+        let audioContext = null;
+        let analyser = null;
+        let dataArray = null;
+        let animationId = null;
+        let barElements = [];
         const statusEl = document.getElementById('status');
         const offerSdpEl = document.getElementById('offerSdp');
         const answerSdpEl = document.getElementById('answerSdp');
@@ -268,132 +273,143 @@
 
         setInterval(updateStats, 1000);
 
-        btnCreateOffer.addEventListener('click', async () => {
-            pc = new RTCPeerConnection({
-                iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-            });
-
-            pc.oniceconnectionstatechange = () => {
-                setStatus('ICE: ' + pc.iceConnectionState, 'status-connecting');
-            };
-
-            pc.onconnectionstatechange = () => {
-                if (pc.connectionState === 'connected') {
-                    setStatus('Connected! Receiving stream.', 'status-connected');
-                } else if (pc.connectionState === 'failed') {
-                    setStatus('Connection failed', 'status-failed');
-                }
-            };
-
-            let audioContext = null;
-            let analyser = null;
-            let dataArray = null;
-            let animationId = null;
-            let barElements = [];
-
-            function createBars(count) {
-                audioBars.innerHTML = '';
-                barElements = [];
-                for (let i = 0; i < count; i++) {
-                    const bar = document.createElement('div');
-                    bar.className = 'audio-bar';
-                    bar.style.height = '3px';
-                    audioBars.appendChild(bar);
-                    barElements.push(bar);
-                }
+        // Move audio visualizer functions outside to avoid recreation
+        function createBars(count) {
+            audioBars.innerHTML = '';
+            barElements = [];
+            for (let i = 0; i < count; i++) {
+                const bar = document.createElement('div');
+                bar.className = 'audio-bar';
+                bar.style.height = '3px';
+                audioBars.appendChild(bar);
+                barElements.push(bar);
             }
+        }
 
-            function startAudioVisualizer(stream) {
-                if (audioContext) {
-                    audioContext.close();
-                }
-                audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                const source = audioContext.createMediaStreamSource(stream);
-                analyser = audioContext.createAnalyser();
-                analyser.fftSize = 64;
-                analyser.smoothingTimeConstant = 0.7;
-                source.connect(analyser);
-
-                const bufferLength = analyser.frequencyBinCount;
-                dataArray = new Uint8Array(bufferLength);
-                createBars(bufferLength);
-
-                audioViz.style.display = 'flex';
-                audioLabel.style.display = 'block';
-
-                function draw() {
-                    if (!analyser) return;
-                    animationId = requestAnimationFrame(draw);
-                    analyser.getByteFrequencyData(dataArray);
-
-                    let sum = 0;
-                    for (let i = 0; i < bufferLength; i++) {
-                        const value = dataArray[i];
-                        sum += value;
-                        const percent = value / 255;
-                        const height = Math.max(3, percent * 50);
-                        barElements[i].style.height = height + 'px';
-                    }
-
-                    const average = sum / bufferLength;
-                    const bubbleScale = 1 + (average / 255) * 0.6;
-                    const glow = (average / 255) * 25;
-                    audioBubble.style.transform = 'scale(' + bubbleScale + ')';
-                    audioBubble.style.boxShadow = '0 0 ' + glow + 'px rgba(76, 175, 80, 0.6)';
-
-                    if (average < 2) {
-                        audioBubble.style.background = '#555';
-                    } else {
-                        audioBubble.style.background = '#4caf50';
-                    }
-                }
-                draw();
+        function startAudioVisualizer(stream) {
+            if (audioContext) {
+                audioContext.close();
             }
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const source = audioContext.createMediaStreamSource(stream);
+            analyser = audioContext.createAnalyser();
+            analyser.fftSize = 64;
+            analyser.smoothingTimeConstant = 0.7;
+            source.connect(analyser);
 
-            function stopAudioVisualizer() {
-                if (animationId) cancelAnimationFrame(animationId);
-                if (audioContext) audioContext.close();
-                analyser = null;
-                audioViz.style.display = 'none';
-                audioLabel.style.display = 'none';
-            }
+            const bufferLength = analyser.frequencyBinCount;
+            dataArray = new Uint8Array(bufferLength);
+            createBars(bufferLength);
 
-            pc.ontrack = (event) => {
-                if (event.track.kind === 'video') {
-                    remoteVideo.srcObject = event.streams[0];
-                } else if (event.track.kind === 'audio') {
-                    remoteAudio.srcObject = event.streams[0];
-                    // Explicit play() to satisfy autoplay policy after user interaction
-                    remoteAudio.play().catch(e => console.log('Audio play deferred:', e));
+            audioViz.style.display = 'flex';
+            audioLabel.style.display = 'block';
 
-                    if (event.streams[0]) {
-                        startAudioVisualizer(event.streams[0]);
-                    }
+            function draw() {
+                if (!analyser) return;
+                animationId = requestAnimationFrame(draw);
+                analyser.getByteFrequencyData(dataArray);
+
+                let sum = 0;
+                for (let i = 0; i < bufferLength; i++) {
+                    const value = dataArray[i];
+                    sum += value;
+                    const percent = value / 255;
+                    const height = Math.max(3, percent * 50);
+                    barElements[i].style.height = height + 'px';
                 }
-            };
 
-            // Add transceivers for video and audio
-            pc.addTransceiver('video', { direction: 'recvonly' });
-            pc.addTransceiver('audio', { direction: 'recvonly' });
+                const average = sum / bufferLength;
+                const bubbleScale = 1 + (average / 255) * 0.6;
+                const glow = (average / 255) * 25;
+                audioBubble.style.transform = 'scale(' + bubbleScale + ')';
+                audioBubble.style.boxShadow = '0 0 ' + glow + 'px rgba(76, 175, 80, 0.6)';
 
-            const offer = await pc.createOffer();
-            await pc.setLocalDescription(offer);
-
-            // Wait for ICE gathering
-            await new Promise(resolve => {
-                if (pc.iceGatheringState === 'complete') {
-                    resolve();
+                if (average < 2) {
+                    audioBubble.style.background = '#555';
                 } else {
-                    pc.addEventListener('icegatheringstatechange', () => {
-                        if (pc.iceGatheringState === 'complete') resolve();
-                    });
+                    audioBubble.style.background = '#4caf50';
                 }
-            });
+            }
+            draw();
+        }
 
-            offerSdpEl.value = btoa(JSON.stringify(pc.localDescription));
-            btnCopyOffer.disabled = false;
-            btnPasteAnswer.disabled = false;
-            setStatus('Offer created. Copy and paste into Go program.', 'status-connecting');
+        function stopAudioVisualizer() {
+            if (animationId) cancelAnimationFrame(animationId);
+            if (audioContext) audioContext.close();
+            analyser = null;
+            audioViz.style.display = 'none';
+            audioLabel.style.display = 'none';
+        }
+
+        function setButtonsState(createDisabled, copyDisabled, pasteDisabled) {
+            btnCreateOffer.disabled = createDisabled;
+            btnCopyOffer.disabled = copyDisabled;
+            btnPasteAnswer.disabled = pasteDisabled;
+        }
+
+        btnCreateOffer.addEventListener('click', async () => {
+            // Disable buttons during offer creation
+            setButtonsState(true, true, true);
+            setStatus('Creating offer...', 'status-connecting');
+
+            try {
+                pc = new RTCPeerConnection({
+                    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+                });
+
+                pc.oniceconnectionstatechange = () => {
+                    setStatus('ICE: ' + pc.iceConnectionState, 'status-connecting');
+                };
+
+                pc.onconnectionstatechange = () => {
+                    if (pc.connectionState === 'connected') {
+                        setStatus('Connected! Receiving stream.', 'status-connected');
+                        setButtonsState(true, false, false);
+                    } else if (pc.connectionState === 'failed') {
+                        setStatus('Connection failed', 'status-failed');
+                        setButtonsState(false, true, true);
+                    }
+                };
+
+                pc.ontrack = (event) => {
+                    if (event.track.kind === 'video') {
+                        remoteVideo.srcObject = event.streams[0];
+                    } else if (event.track.kind === 'audio') {
+                        remoteAudio.srcObject = event.streams[0];
+                        // Explicit play() to satisfy autoplay policy after user interaction
+                        remoteAudio.play().catch(e => console.log('Audio play deferred:', e));
+
+                        if (event.streams[0]) {
+                            startAudioVisualizer(event.streams[0]);
+                        }
+                    }
+                };
+
+                // Add transceivers for video and audio
+                pc.addTransceiver('video', { direction: 'recvonly' });
+                pc.addTransceiver('audio', { direction: 'recvonly' });
+
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+
+                // Wait for ICE gathering
+                await new Promise(resolve => {
+                    if (pc.iceGatheringState === 'complete') {
+                        resolve();
+                    } else {
+                        pc.addEventListener('icegatheringstatechange', () => {
+                            if (pc.iceGatheringState === 'complete') resolve();
+                        });
+                    }
+                });
+
+                offerSdpEl.value = btoa(JSON.stringify(pc.localDescription));
+                setButtonsState(true, false, false);
+                setStatus('Offer created. Copy and paste into Go program.', 'status-connecting');
+            } catch (error) {
+                setStatus('Error creating offer: ' + error.message, 'status-failed');
+                setButtonsState(false, true, true);
+            }
         });
 
         btnCopyOffer.addEventListener('click', () => {
@@ -403,12 +419,16 @@
         });
 
         btnPasteAnswer.addEventListener('click', async () => {
+            setButtonsState(true, true, true);
+            setStatus('Processing answer...', 'status-connecting');
+
             try {
                 const answer = JSON.parse(atob(answerSdpEl.value.trim()));
                 await pc.setRemoteDescription(answer);
                 setStatus('Answer set. Connecting...', 'status-connecting');
             } catch (e) {
                 setStatus('Error parsing answer: ' + e.message, 'status-failed');
+                setButtonsState(true, false, false);
             }
         });
     </script>
