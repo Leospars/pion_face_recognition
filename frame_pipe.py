@@ -16,16 +16,12 @@ def signal_handler(sig, frame):
     cv2.destroyAllWindows()
     sys.exit(0)
 
-def read_frames(pipe_path, width=None, height=None, channels=3, show_display=False, capture_frames=(lambda x: None)):
+def read_frames(pipe_path, width=0, height=0, channels=3, show_display=True, face_recog=lambda frame: []):
     """Read frames from pipe and display them in a window"""
     # If dimensions not specified, we'll need to detect them from the first frame
     frame_size = None
     frame_count = 0
     window_name = "Face Recognition Stream"
-
-    if not width or not height:
-        print("Width and height must be specified")
-        return
 
     # Set up signal handlers
     signal.signal(signal.SIGINT, signal_handler)
@@ -47,10 +43,8 @@ def read_frames(pipe_path, width=None, height=None, channels=3, show_display=Fal
             pipe = open(pipe_path, 'rb')
             print(f"Connected to pipe: {pipe_path}")
 
-        print("Press 'q' in the window to quit")
-        print("Waiting for first frame to detect dimensions...")
-
         if not width or not height:
+            print("Waiting for first frame to detect dimensions...")
             # Smart detection - analyze frame boundaries
             # Read a moderate chunk to analyze patterns
             chunk = pipe.read(8192)  # 8K chunk should contain frame boundary
@@ -86,16 +80,15 @@ def read_frames(pipe_path, width=None, height=None, channels=3, show_display=Fal
                 else:
                     width, height = 640, 480
                 frame_size = width * height * channels
-
                 print(f"Estimated: {width}x{height} = {frame_size} bytes")
                 # Read the rest of the first frame
                 remaining_bytes = frame_size - len(chunk)
                 remaining_data = pipe.read(remaining_bytes)
                 frame_data = chunk + remaining_data
                 # this singular frames is lost because user didn't input dimensions 😔 RIP
-            else:
-                frame_size = width * height * channels
-                print(f"Using provided dimensions: {width}x{height} = {frame_size} bytes")
+
+        frame_size = width * height * channels
+        print(f"Using provided dimensions: {width}x{height} = {frame_size} bytes")
 
         while True:
             frame_data = None  # Initialize frame_data
@@ -108,12 +101,10 @@ def read_frames(pipe_path, width=None, height=None, channels=3, show_display=Fal
             if len(frame_data) != frame_size:
                 print(f"Incomplete frame: {len(frame_data)}/{frame_size} bytes")
                 continue
+            try:
+                # Convert to numpy array for processing
+                frame = np.frombuffer(frame_data, dtype=np.uint8)
 
-            # Convert to numpy array for processing
-            frame = np.frombuffer(frame_data, dtype=np.uint8)
-            capture_frames(frame)
-
-            if display_frame:
                 # Reshape based on dimensions and channels
                 if channels == 1:
                     frame = frame.reshape((height, width))
@@ -127,19 +118,48 @@ def read_frames(pipe_path, width=None, height=None, channels=3, show_display=Fal
                 # Convert to BGR for OpenCV display if needed
                 if channels == 3:
                     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                try:
+                    persons = face_recog(frame)
+                    print(f"Faces detected: {persons}")
+                except Exception as e:
+                    print(f"Failed to process captured frame {frame_count}: {e}")
+                    break
 
-                print(f"Frame {frame_count}: {frame.shape} ({'RGB' if channels == 3 else 'Grayscale' if channels == 1 else 'YUYV422'})")
-                display_frame = frame
-                # Display the frame
-                cv2.imshow(window_name, display_frame)
-            frame_count += 1
+                if show_display:
+                    if persons:
+                        for person in persons:
+                            face = person["bbox"]
+                            # Draw bounding box around detected face
+                            x, y, w, h = int(face["x"]), int(face["y"]), int(face["w"]), int(face["h"])
+                            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-            # Check for quit key or window close
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q') or cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
-                print("Quit requested by user")
+                            # Add label with confidence score
+                            score = person["score"]
+                            name = person["name"]
+                            label = f"{name}: {score:.2f}"
+                            cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+                    # Display the frame
+                    cv2.imshow(window_name, frame)
+
+                    # Check for quit key or window close
+                    key = cv2.waitKey(1) & 0xFF
+                    try:
+                        if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                            print("Quit requested by window close button")
+                            break
+                    except cv2.error:
+                        # Catch instances where window was abruptly closed mid-cycle
+                        break
+                    if key == ord('q'):
+                        print("Quit requested by user")
+                        break
+
+            except Exception as e:
+                print(f"Error displaying frame {frame_count}: {e}")
                 break
 
+            frame_count += 1
             # Simple motion detection simulation
             if frame_count % 100 == 0:
                 avg_brightness = np.mean(frame)
@@ -176,7 +196,10 @@ def read_frames(pipe_path, width=None, height=None, channels=3, show_display=Fal
             # Kill all ffmpeg process
             os.system("taskkill /f /IM ffmpeg.exe")
 
-# (Start-Process "ffmpeg.exe" "-hide_banner -f dshow -pixel_format yuyv422 -video_size 1920x1080 -rtbufsize 10M -i video=@device_pnp_\\?\usb#vid_0c45&pid_6366&mi_00#6&d2e721e&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global -f rawvideo -pix_fmt yuyv422 -r 5 pipe:1" -PassThru -NoNewWindow).WaitForExit(10000) | & "D:\Code_Main\Final_Year_Project\SBC\face_recog\.venv\Scripts\python.exe" -u "d:\Code_Main\Final_Year_Project\SBC\webrtc_video\play-from-disk\frame_pipe.py" "-" "yuyv422" "1920" "1080"
+# # Terminal command example:
+# ffmpeg -hide_banner -f dshow -pixel_format yuyv422 -video_size 1920x1080 -rtbufsize 10M -i video="Arducam USB Camera" -f `
+# rawvideo -pix_fmt yuyv422 -r 5 pipe:1 | & "D:\Code_Main\Final_Year_Project\SBC\face_recog\.venv\Scripts\python.exe" -u `
+# "d:\Code_Main\Final_Year_Project\SBC\webrtc_video\frame_pipe.py" "-" "yuyv422" "1920" "1080"
 
 def main():
     if len(sys.argv) < 2:
@@ -190,40 +213,37 @@ def main():
         sys.exit(1)
 
     pipe_path = sys.argv[1]
+    format_type = "rgb24"
+    width, height = None, None
 
-    # Parse quality preset or format
-    if len(sys.argv) > 2:
+    if len(sys.argv) >= 5:
+        # Explicitly read out direct format, width, and height structure
+        format_type = sys.argv[2].lower()
+        width = int(sys.argv[3])
+        height = int(sys.argv[4])
+    elif len(sys.argv) == 3:
         arg2 = sys.argv[2].lower()
-        if arg2 in ['verylow', 'low', 'medium', 'high']:
-            # Quality preset
-            if arg2 == 'verylow':
-                width, height = 320, 240
-            elif arg2 == 'low':
-                width, height = 640, 480
-            elif arg2 == 'medium':
-                width, height = 1280, 720
-            elif arg2 == 'high':
-                width, height = 1920, 1080
-            format_type = sys.argv[3] if len(sys.argv) > 3 else "rgb24"
-        else:
-            # Format specified
-            format_type = arg2
-            width = int(sys.argv[3]) if len(sys.argv) > 3 else None
-            height = int(sys.argv[4]) if len(sys.argv) > 4 else None
-    else:
-        format_type = "rgb24"
-        width, height = None, None
+        if arg2 == 'verylow': width, height = 320, 240
+        elif arg2 == 'low': width, height = 640, 480
+        elif arg2 == 'medium': width, height = 1280, 720
+        elif arg2 == 'high': width, height = 1920, 1080
+        else: format_type = arg2
 
-    # Determine channels based on format
     if format_type == "grayscale":
         channels = 1
     elif format_type == "yuyv422":
-        channels = 2  # YUYV422 uses 2 bytes per pixel
+        channels = 2
     else:
-        channels = 3  # RGB24 uses 3 bytes per pixel
+        channels = 3
 
-    print(f"Starting frame reader: {format_type} format, {width or 'auto'}x{height or 'auto'} resolution")
-    read_frames(pipe_path, width=width, height=height, channels=channels)
+    try:
+        print(f"Starting frame reader: {format_type} format, {width}x{height} resolution ({channels} channels)")
+        read_frames(pipe_path, width=width, height=height, channels=channels)
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

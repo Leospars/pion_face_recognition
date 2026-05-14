@@ -4,10 +4,9 @@ import os
 import time
 import csv
 import sys
-import json
-import base64
-from datetime import datetime
 import onnxruntime as ort
+from my_logger import log
+from frame_pipe import read_frames as read_frames_from_pipe
 
 # -----------------------------
 # Configuration
@@ -33,7 +32,7 @@ class MobileFaceRecognizer:
         self.input_name = self.session.get_inputs()[0].name
         self.output_names = [output.name for output in self.session.get_outputs()]
 
-        print(f"MobileFaceRecognizer initialized with model: {model_path}")
+        log.info(f"MobileFaceRecognizer initialized with model: {model_path}")
 
     def alignCrop(self, image, face):
         """Simple alignment and crop based on face bounding box"""
@@ -115,25 +114,44 @@ def extract_embedding_from_frame(frame):
 # -----------------------------
 # Build face database
 # -----------------------------
-def load_face_database():
-    """Load known faces from database"""
+def load_face_database(update=False):
+    """Load known faces from database
+        If update=True, recompute all images and save to centroid.npy
+    """
+
     face_db = {}
     if not os.path.exists(KNOWN_FACES_DIR):
+        log.error(f"Faces database directory '{KNOWN_FACES_DIR}' not found")
         return face_db
 
     for dir in os.listdir(KNOWN_FACES_DIR):
         name = dir
         face_db[name] = []
         person_path = os.path.join(KNOWN_FACES_DIR, dir)
-        if not os.path.isdir(person_path):
-            continue
-        for file in os.listdir(person_path):
-            if file.endswith(".npy"):
-                emb = np.load(os.path.join(person_path, file))
-                face_db[name].append(emb)
-    return face_db
 
-face_db = load_face_database()
+        if update:
+            gallery_path = os.path.join(person_path, "gallery")
+            if os.path.isdir(gallery_path):
+                for file in os.listdir(gallery_path):
+                    if file.split(".")[-1] in ["jpg", "jpeg", "png", "webp"]:
+                        log.debug(f"Creating embedding for {name} from {file}")
+                        emb = extract_embedding_from_frame(cv2.imread(os.path.join(gallery_path, file)))[0]
+                        if emb is not None:
+                            face_db[name].append(emb)
+
+            if len(face_db[name]) > 0:
+                np_arr = np.array(face_db[name])
+                centroid = np.mean(np_arr, axis=0)
+                # store embedding in directory
+                np.save(f"{KNOWN_FACES_DIR}/{dir}/centroid.npy", centroid)
+
+        for file in os.listdir(person_path):
+            if file.endswith("centroid.npy"):
+                log.debug(f"Using stored centroid embedding {file} for {name}")
+                emb = np.load(os.path.join(person_path, file))
+                face_db[name] = [emb]
+                break
+    return face_db
 
 # ----------------------------------------------------
 # OPTION 2: Manual cosine similarity (RECOMMENDED)
@@ -141,6 +159,9 @@ face_db = load_face_database()
 def match_face(query_embedding, face_db=None):
     if face_db is None:
         face_db = globals().get('face_db', {})
+    if len(face_db) == 0:
+        return "No Face DB"
+
     best_name = "Unknown"
     best_score = 0.0
 
@@ -162,48 +183,60 @@ def match_face(query_embedding, face_db=None):
             best_name = name
 
     if best_score >= COSINE_THRESHOLD:
-        return f"{best_name} ({best_score:.3f})"
+        return best_name, best_score
     else:
-        return f"Unknown {best_name} ({best_score:.3f})"
+        return "Unknown", best_score
 
-def process_frame(frame_data, detector, recognizer, face_db):
+face_detected = False
+def process_frame(frame_data, detector: cv2.FaceDetectorYN, recognizer: MobileFaceRecognizer, face_db: dict):
     """Process a single frame and return identified persons with timing info"""
-    # Decode base64 image
-    try:
-        img_bytes = base64.b64decode(frame_data)
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if frame is None:
+
+    # Ensure it is a valid numpy array
+    if isinstance(frame_data, np.ndarray):
+        frame = frame_data
+    else:
+        try:
+            frame = np.asarray(frame_data, dtype=np.uint8)
+        except Exception as e:
+            log.error(f"Error converting frame data to numpy array: {e}")
             return [], 0.0, 0.0
-    except Exception as e:
-        print(f"Error decoding frame: {e}", file=sys.stderr)
+
+    if frame is None:
         return [], 0.0, 0.0
+    try:
+        h, w = frame.shape[:2]
+        detector.setInputSize((w, h))
 
-    h, w = frame.shape[:2]
-    detector.setInputSize((w, h))
+        start_det = time.time()
+        _, faces = detector.detect(frame)
+        det_time = (time.time() - start_det) * 1000.0
 
-    start_det = time.time()
-    _, faces = detector.detect(frame)
-    det_time = (time.time() - start_det) * 1000.0
+        global face_detected
+        if faces is None:
+            if not face_detected:
+                log.debug("No faces detected")
+                face_detected = True
+            return [], det_time, 0.0
 
-    if faces is None:
-        return [], det_time, 0.0
+        face_detected = False
+        persons = []
+        start_rec = time.time()
+        for face in faces:
+            aligned = recognizer.alignCrop(frame, face)
+            embedding = recognizer.feature(aligned)
 
-    persons = []
-    start_rec = time.time()
-    for face in faces:
-        aligned = recognizer.alignCrop(frame, face)
-        embedding = recognizer.feature(aligned)
+            if embedding is not None:
+                name, score = match_face(embedding.flatten(), face_db)
+                # Add bounding box
+                x, y, w_box, h_box = face[:4].astype(int)
+                person = {"name": name, "score": score, "bbox": {"x": int(x), "y": int(y), "w": int(w_box), "h": int(h_box)}}
+                persons.append(person)
+        rec_time = (time.time() - start_rec) * 1000.0
 
-        if embedding is not None:
-            person = match_face(embedding.flatten(), face_db)
-            # Add bounding box
-            x, y, w_box, h_box = face[:4].astype(int)
-            person["bbox"] = {"x": int(x), "y": int(y), "w": int(w_box), "h": int(h_box)}
-            persons.append(person)
-    rec_time = (time.time() - start_rec) * 1000.0
-
-    return persons, det_time, rec_time
+        return persons, det_time, rec_time
+    except Exception as e:
+        log.exception(f"Error processing frame: {e}")
+        return [], 0.0, 0.0
 
 
 class PerformanceLogger:
@@ -227,202 +260,85 @@ class PerformanceLogger:
         if self.csv_file:
             self.csv_file.close()
 
-
 def main():
-    """Main loop - read JSON from stdin, process, write JSON to stdout"""
+    import argparse
+    import os
+    from frame_pipe import read_frames as read_frames_from_pipe
+    import json
+
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    DEFAULT_LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
+
+    arg_parser = argparse.ArgumentParser()
+    arg_parser.add_argument("-i", "--input", default="-")
+    arg_parser.add_argument("--format", default="rgb24")
+    arg_parser.add_argument("--width", type=int, default=None)
+    arg_parser.add_argument("--height", type=int, default=None)
+    arg_parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
+    arg_parser.add_argument("--face-det-model", default=FACE_DET_MODEL)
+    arg_parser.add_argument("--face-rec-model", default=FACE_REC_MODEL)
+    arg_parser.add_argument("--update-face-db", action="store_true")
+    args = arg_parser.parse_args()
+
+    # Example terminal call
+    # ffmpeg -hide_banner -f dshow -pixel_format yuyv422 -video_size 1920x1080 -rtbufsize 10M -i video="Arducam USB Camera" -f `
+    # rawvideo -pix_fmt yuyv422 -r 5 pipe:1 | & "D:\Code_Main\Final_Year_Project\SBC\face_recog\.venv\Scripts\python.exe" -u `
+    # "d:\Code_Main\Final_Year_Project\SBC\webrtc_video\face_identify.py" --format "rgb24" --width 1920 --height 1080 --update-face-db
+
+    """Main loop - process frames from ffmpeg stdin, write JSON to stdout"""
     # Initialize models
-    if not os.path.exists(FACE_DET_MODEL) or not os.path.exists(FACE_REC_MODEL):
-        print(json.dumps({"error": "Face models not found", "face_det_model": os.path.abspath(FACE_DET_MODEL), "face_rec_model": os.path.abspath(FACE_REC_MODEL)}))
+    if not os.path.exists(args.face_det_model) or not os.path.exists(args.face_rec_model):
+        log.error("Face models not found", extra={"face_det_model": os.path.abspath(args.face_det_model), "face_rec_model": os.path.abspath(args.face_rec_model)})
         sys.exit(1)
 
-    detector = cv2.FaceDetectorYN.create(FACE_DET_MODEL, "", IMAGE_SIZE)
-    recognizer = MobileFaceRecognizer(FACE_REC_MODEL, use_gpu=False)  # Use CPU for stability
-    face_db = load_face_database()
+    if args.log_dir == DEFAULT_LOG_DIR:
+        if not os.path.exists(DEFAULT_LOG_DIR):
+            log.info("Creating default log directory", extra={"log_dir": os.path.abspath(DEFAULT_LOG_DIR)})
+            os.makedirs(DEFAULT_LOG_DIR, exist_ok=True)
 
-    logger = PerformanceLogger(log_dir=os.path.join(SCRIPT_DIR, "logs"))
+    if not os.path.exists(args.log_dir):
+        log.error("Log directory not found", extra={"log_dir": os.path.abspath(args.log_dir)})
+        sys.exit(1)
 
-    print(json.dumps({"status": "ready", "persons_in_db": len(face_db)}), flush=True)
+    format_type = args.format
+    if format_type == "grayscale":
+        channels = 1
+    elif format_type == "yuyv422":
+        channels = 2
+    else:
+        channels = 3
 
-    frame_count = 0
-    # Process frames from stdin
-    for line in sys.stdin:
+    detector = cv2.FaceDetectorYN.create(args.face_det_model, "", IMAGE_SIZE)
+    recognizer = MobileFaceRecognizer(args.face_rec_model, use_gpu=False)  # Use CPU for stability
+    face_db = load_face_database(args.update_face_db)
+    if(len(face_db) == 0):
+        log.error("No persons in database")
+        sys.exit(1)
+    perfLog = PerformanceLogger(args.log_dir)
+    def process_frame_util(frame, detector: cv2.FaceDetectorYN, recognizer: MobileFaceRecognizer, face_db: dict, perfLog: PerformanceLogger):
+        frame_count = 0
+        # Process frames from stdin
         try:
-            msg = json.loads(line.strip())
-            frame_data = msg.get("frame")
-            timestamp = msg.get("timestamp", time.time())
-
-            if not frame_data:
-                continue
-
-            persons, det_time, rec_time = process_frame(frame_data, detector, recognizer, face_db)
+            persons, det_time, rec_time = process_frame(frame, detector, recognizer, face_db)
             frame_count += 1
 
-            logger.log(frame_count, det_time, rec_time, len(persons))
+            perfLog.log(frame_count, det_time, rec_time, len(persons))
 
             result = {
                 "persons": persons,
-                "timestamp": timestamp,
-                "det_time": det_time,
-                "rec_time": rec_time
+                "timestamp": float(time.time()) if persons else 0,
+                "det_time": float(det_time),
+                "rec_time": float(rec_time)
             }
-            print(json.dumps(result), flush=True)
+            log.info(json.dumps(result))
 
-        except json.JSONDecodeError:
-            print(json.dumps({"error": "Invalid JSON"}), flush=True)
         except Exception as e:
-            print(json.dumps({"error": str(e)}), flush=True)
+            log.exception("Error processing frame", extra={"error": str(e)})
 
-    logger.close()
+        return persons
 
+    read_frames_from_pipe(args.input, args.width, args.height, channels, True, lambda frame: process_frame_util(frame, detector, recognizer, face_db, perfLog))
+    perfLog.close()
 
 if __name__ == "__main__":
-    # -----------------------------
-    # Query face
-    # -----------------------------
-    current_result = "Initializing..."
-
-    # Initialize timing variables for averaging
-    det_times = []
-    rec_times = []
-    avg_window_seconds = 1.0  # 5-second time window for SMA
-
-    # Initialize logging variables
-    frame_count = 0
-    log_update_interval = 5 # Log summary every 30 frames
-    det_sma_history = []
-    rec_sma_history = []
-    time_stamps = []
-
-    # Initialize time-based tracking
-    inference_times = []  # Store (timestamp, det_time, rec_time)
-    inference_count = 0
-    inferences_per_second = 0
-    last_inference_reset = time.time()
-    last_log_time = time.time()
-    not_detected_timestamp = 0
-    current_timestamp = 0
-
-    # Initialize FPS tracking using OpenCV's TickMeter
-    fps_meter = cv2.TickMeter()
-    fps_history = []
-
-    # Setup CSV logging
-    csv_filename = f"./logs/face_recognition_performance.csv"
-    csv_file = open(csv_filename, 'w', newline='')
-    csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(['Frame','Time', 'Detection_SMA_ms', 'Recognition_SMA_ms', 'FPS', 'FPS_SMA', 'Inferences_Per_Second'])
-
-    print(f"Performance data will be logged to: {csv_filename}")
-    try:
-        # Initialize camera
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            print("Error: Could not open camera")
-            exit()
-        cap.set(cv2.CAP_PROP_BRIGHTNESS, 1.0)
-
-        print("Face recognition started. Press 'q' to quit.")
-
-        while True:
-            hasFrame, frame = cap.read()
-            if not hasFrame:
-                print("Error: Could not read frame")
-                break
-
-            frame_count += 1
-
-            # Keep only last 30 FPS measurements for averaging
-            if len(fps_history) > 30:
-                fps_history.pop(0)
-
-            # Calculate average FPS (SMA)
-            avg_fps = sum(fps_history) / len(fps_history) if fps_history else 0
-
-            # Start FPS measurement
-            fps_meter.start()
-            query_embedding, face_coords, det_time, rec_time = extract_embedding_from_frame(frame)
-            # Stop FPS measurement and get current FPS
-            fps_meter.stop()
-            fps = fps_meter.getFPS()
-            fps_history.append(fps)
-
-            if query_embedding is not None:
-                current_result = match_face(query_embedding)
-                print(f"Recognition result: {current_result}")
-
-                # Track inference timing with timestamps
-                current_timestamp = time.time() - not_detected_timestamp
-                inference_times.append((current_timestamp, det_time, rec_time))
-                inference_count += 1
-
-                # Remove old data outside the time window (5 seconds)
-                cutoff_time = current_timestamp - avg_window_seconds
-                inference_times = [(t, d, r) for t, d, r in inference_times if t >= cutoff_time]
-
-                # Log to CSV and update console summary every 5 seconds
-                if time.time() - last_log_time >= avg_window_seconds:
-                    last_log_time = time.time()
-                    # Calculate time-based SMA
-                    inferences_per_second = len(inference_times) / avg_window_seconds
-                    if inference_times:
-                        recent_det_times = [d for _, d, _ in inference_times]
-                        recent_rec_times = [r for _, _, r in inference_times]
-                        avg_det = sum(recent_det_times) / len(recent_det_times)
-                        avg_rec = sum(recent_rec_times) / len(recent_rec_times)
-                    else:
-                        avg_det = avg_rec = 0
-
-                    # Write to CSV
-                    csv_writer.writerow([frame_count, current_timestamp, avg_det, avg_rec, fps, avg_fps, inferences_per_second])
-                    csv_file.flush()  # Ensure data is written immediately
-
-                    # Console summary
-                    # print("\n" + "="*90)
-                    # print(f"PERFORMANCE SUMMARY - Frame {frame_count}")
-                    # print("="*90)
-                    # print(f"Current: Detection {det_time:.2f}ms | Recognition {rec_time:.2f}ms | FPS: {fps:.1f} (SMA: {avg_fps:.1f}) | Inf/sec: {inferences_per_second}")
-                    # print(f"SMA ({avg_window_seconds}s window): Detection {avg_det:.2f}ms | Recognition {avg_rec:.2f}ms | FPS SMA: {avg_fps:.1f}")
-
-                    # # Calculate statistics
-                    # print(f"Inferences in last {avg_window_seconds}s: {len(inference_times)}")
-                    # print("="*90 + "\n")
-
-                print(f"Face detection: {det_time:.2f}ms | Face recognition: {rec_time:.2f}ms")
-                # Draw bounding box around detected face
-                if face_coords is not None:
-                    x, y, w, h = int(face_coords[0]), int(face_coords[1]), int(face_coords[2]), int(face_coords[3])
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            else:
-                if(current_result != "No face detected ..."):
-                    current_result = "No face detected ..."
-                    print(current_result)
-                frame_count -= 1
-                not_detected_timestamp = time.time() - current_timestamp
-
-
-            # Add text overlay with current result and FPS
-            cv2.putText(frame, current_result, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
-            # Add FPS and inference display with SMA
-            perf_text = f"FPS: {fps:.1f} (SMA: {avg_fps:.1f}) | Inf/sec: {inferences_per_second}"
-            cv2.putText(frame, perf_text, (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
-            # Display frame
-            cv2.imshow("Face Recognition", frame)
-
-            # Check for quit key
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-
-    except KeyboardInterrupt:
-        cap.release()
-        cv2.destroyAllWindows()
-        csv_file.close()
-        print(f"\nPerformance data saved to: {csv_filename}")
-        print(f"Total frames processed: {frame_count}")
-        if det_sma_history and rec_sma_history:
-            print(f"Final SMA: Detection {np.mean(det_sma_history[-10:]):.2f}ms | Recognition {np.mean(rec_sma_history[-10:]):.2f}ms")
-        if fps_history:
-            print(f"Final FPS: Current {fps:.1f} | SMA {avg_fps:.1f} | Min {min(fps_history):.1f} | Max {max(fps_history):.1f}")
+    main()
