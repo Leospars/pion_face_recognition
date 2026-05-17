@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 The Pion community <https://pion.ly>
 // SPDX-License-Identifier: MIT
 
-//go:build !js
+//go:build ignore
 
 // play-from-disk demonstrates how to send video and/or audio to your browser from files saved to disk.
 package main
@@ -9,14 +9,19 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,7 +31,9 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
+	"github.com/pion/webrtc/v4/pkg/media/h264reader"
 	"github.com/pion/webrtc/v4/pkg/media/ivfreader"
+	"github.com/pion/webrtc/v4/pkg/media/oggreader"
 )
 
 // Default configuration - can be overridden via config.json or CLI
@@ -35,13 +42,19 @@ const (
 	DefaultStunServerURL      = "stun:stun.l.google.com:19302"
 	DefaultCameraName         = "stream_cam"
 	DefaultVideoDevice        = "/dev/video0"
-	DefaultVideoCodec         = "libvpx" // VP8 for IVF
+	DefaultAudioDevice        = "default"
+	DefaultEncoder            = "libvpx" // VP8 for IVF
 	DefaultVideoWidth         = 1280
 	DefaultVideoHeight        = 720
 	DefaultVideoFPS           = 30
 	DefaultVideoBitrate       = "1M"
-	DefaultFaceRecogFormat    = "yuv420p"
+	DefaultAudioBitrate       = "128k"
+	DefaultVideoFormat        = "h264"
+	DefaultFaceRecogFormat    = "yuyv422"
 	DefaultFaceRecogPipe      = "face_recog_pipe"
+	DefaultFFmpegLogFile      = "ffmpeg.log"
+	DefaultPythonCompiler     = "D:/Code_Main/Final_Year_Project/SBC/face_recog/.venv/Scripts/python.exe"
+	DefaultPythonScript       = "D:/Code_Main/Final_Year_Project/SBC/webrtc_video/face_identify.py"
 )
 
 // Config holds all configuration options
@@ -50,16 +63,21 @@ type Config struct {
 	StunServerURL      string      `json:"stunServerUrl"`
 	CameraName         string      `json:"cameraName"`
 	VideoDevice        string      `json:"videoDevice"`
-	VideoCodec         string      `json:"videoCodec"`
+	AudioDevice        string      `json:"audioDevice"`
+	Encoder            string      `json:"encoder"`
 	VideoWidth         int         `json:"videoWidth"`
 	VideoHeight        int         `json:"videoHeight"`
 	VideoFPS           int         `json:"videoFps"`
 	VideoBitrate       string      `json:"videoBitrate"`
+	AudioBitrate       string      `json:"audioBitrate"`
 	FaceRecogEnabled   bool        `json:"faceRecogEnabled"`
+	VideoFormat        string      `json:"videoFormat"`
 	FaceRecogFormat    string      `json:"faceRecogFormat"`
 	FaceRecogPipe      string      `json:"faceRecogPipe"`
-	TestPipeOnly       bool        `json:"testPipeOnly"`
 	ICECredentials     []ICEServer `json:"iceCredentials,omitempty"`
+	GPUAcceleration    bool        `json:"gpuAcceleration"`
+	GPUDevice          string      `json:"gpuDevice"`
+	FFmpegLogFile      string      `json:"ffmpegLogFile"`
 }
 
 // ICEServer represents a TURN/STUN server with optional auth
@@ -75,15 +93,20 @@ var config = Config{
 	StunServerURL:      DefaultStunServerURL,
 	CameraName:         DefaultCameraName,
 	VideoDevice:        DefaultVideoDevice,
-	VideoCodec:         DefaultVideoCodec,
+	AudioDevice:        DefaultAudioDevice,
+	Encoder:            DefaultEncoder,
 	VideoWidth:         DefaultVideoWidth,
 	VideoHeight:        DefaultVideoHeight,
 	VideoFPS:           DefaultVideoFPS,
 	VideoBitrate:       DefaultVideoBitrate,
+	AudioBitrate:       DefaultAudioBitrate,
 	FaceRecogEnabled:   false,
+	VideoFormat:        DefaultVideoFormat,
 	FaceRecogFormat:    DefaultFaceRecogFormat,
 	FaceRecogPipe:      DefaultFaceRecogPipe,
-	TestPipeOnly:       false,
+	GPUAcceleration:    false,
+	GPUDevice:          "auto",
+	FFmpegLogFile:      filepath.ToSlash(DefaultFFmpegLogFile),
 	ICECredentials: []ICEServer{
 		{URLs: "stun:stun.l.google.com:19302"},
 		{URLs: "stun:stun1.l.google.com:19302"},
@@ -121,14 +144,58 @@ type PersonInfo struct {
 	Name       string  `json:"name"`
 	Confidence float64 `json:"confidence"`
 	Bbox       *BBox   `json:"bbox,omitempty"`
+	Timestamp  int64   `json:"timestamp,omitempty"`
 }
 
 // Bbox represents bounding box
 type BBox struct {
-	X int `json:"x"`
-	Y int `json:"y"`
-	W int `json:"w"`
-	H int `json:"h"`
+	x int `json:"x"`
+	y int `json:"y"`
+	w int `json:"w"`
+	h int `json:"h"`
+}
+
+// ErrorInfo tracks last logged message for deduplication
+type ErrorInfo struct {
+	LastMessage string
+}
+
+// CameraQuality defines camera quality settings
+type CameraQuality struct {
+	Width   int
+	Height  int
+	FPS     int
+	Bitrate string
+	Format  string
+	Name    string
+}
+
+// VideoCapability represents a supported video resolution and FPS
+type VideoCapability struct {
+	VCodec      string
+	PixelFormat string
+	Width       int
+	Height      int
+	FPS         int
+}
+
+// DeviceCapabilities holds supported device capabilities
+type DeviceCapabilities struct {
+	SupportedResolutions []VideoCapability
+}
+
+// Predefined camera quality levels (from highest to lowest)
+var cameraQualities = []CameraQuality{
+	{Width: 1920, Height: 1080, FPS: 30, Bitrate: "2M", Name: "1080p30(h264)", Format: "h264"},
+	{Width: 1920, Height: 1080, FPS: 30, Bitrate: "2M", Name: "1080p30(mpeg)", Format: "mpeg"},
+	{Width: 1280, Height: 720, FPS: 30, Bitrate: "1M", Name: "720p30(h264)", Format: "h264"},
+	{Width: 1280, Height: 720, FPS: 30, Bitrate: "1M", Name: "720p30(mpeg)", Format: "mpeg"},
+	{Width: 960, Height: 540, FPS: 30, Bitrate: "500k", Name: "540p30(mpeg)", Format: "h264"},
+	{Width: 960, Height: 540, FPS: 25, Bitrate: "400k", Name: "540p25(mpeg)", Format: "mpeg"},
+	{Width: 640, Height: 480, FPS: 30, Bitrate: "400k", Name: "480p30(h264)", Format: "h264"},
+	{Width: 640, Height: 480, FPS: 30, Bitrate: "400k", Name: "480p30(mpeg)", Format: "mpeg"},
+	{Width: 640, Height: 480, FPS: 30, Bitrate: "400k", Name: "480p30(yuyv422)", Format: "yuyv422"},
+	{Width: 640, Height: 480, FPS: 30, Bitrate: "400k", Name: "480p30(nv12)", Format: "nv12"},
 }
 
 // CameraPeer manages WebRTC connection as a camera
@@ -139,21 +206,35 @@ type CameraPeer struct {
 	pc               *webrtc.PeerConnection
 	videoTrack       *webrtc.TrackLocalStaticSample
 	audioTrack       *webrtc.TrackLocalStaticSample
+	tracksOnce       sync.Once
 	viewers          map[string]bool
 	viewersMu        sync.RWMutex
+	webrtcMu         sync.Mutex // serializes offer/answer/ICE and PC reset (sendOffer runs in goroutines)
 	stopCh           chan struct{}
-	videoInput       string
+	videoDevice      string
 	audioEnabled     bool
 	faceRecogEnabled bool
 	loopVideo        bool
-	audioFile        string
 	ffmpegCmd        *exec.Cmd
-	ivfPipe          io.ReadCloser
-	framePipe        io.ReadCloser
+	videoPipe        io.ReadCloser
+	h264Mode         bool // True for H.264, false for IVF
+	audioPipe        io.ReadCloser
+	audioTempFile    string
+	facePipe         io.ReadCloser
 	lastFrame        []byte
 	lastFrameMu      sync.RWMutex
 	lastPersonCount  int
 	shuttingDown     bool
+	lastErrorTime    map[string]ErrorInfo
+	lastErrorMu      sync.Mutex
+	currentQuality   int
+	qualityMu        sync.Mutex
+	restartingFFmpeg bool
+	restartMu        sync.Mutex
+	ffmpegRunning    bool
+	ffmpegWaitDone   chan struct{}
+	faceRecogFile    string
+	facePythonCmd    *exec.Cmd
 }
 
 // arrayFlags allows multiple -C flags
@@ -170,6 +251,195 @@ func (a *arrayFlags) Set(value string) error {
 
 func toPtr(init webrtc.ICECandidateInit) *webrtc.ICECandidateInit {
 	return &init
+}
+
+// findMatchingQuality finds the closest quality level to current config
+func findMatchingQuality() int {
+	if len(cameraQualities) == 0 {
+		return 0
+	}
+
+	// First, try to find exact match for width and height
+	exactResMatches := []int{}
+	var videoFormatExists = false
+	for i, quality := range cameraQualities {
+		if quality.Format == config.VideoFormat {
+			videoFormatExists = true
+			if quality.Width == config.VideoWidth && quality.Height == config.VideoHeight {
+				if quality.FPS == config.VideoFPS {
+					log.Printf("Setting resolution %dx%d, FPS %d, format %s", config.VideoWidth, config.VideoHeight, config.VideoFPS, config.VideoFormat)
+					return i
+				}
+				exactResMatches = append(exactResMatches, i)
+			}
+		}
+	}
+	if !videoFormatExists {
+		log.Fatalf("Video format '%s' is not supported by this camera: '%s'", config.VideoFormat, config.CameraName)
+	} else if len(exactResMatches) > 0 {
+		// Find the closest FPS match
+		availableFPS := []int{}
+		for _, idx := range exactResMatches {
+			availableFPS = append(availableFPS, cameraQualities[idx].FPS)
+		}
+		log.Fatalf("%d FPS not found for resolution %dx%d, format %s.\nAvailable FPS: %v", config.VideoFPS, config.VideoWidth, config.VideoHeight, config.VideoFormat, availableFPS)
+	}
+	log.Fatalf("No matching quality found for resolution %dx%d, FPS %d, format %s", config.VideoWidth, config.VideoHeight, config.VideoFPS, config.VideoFormat)
+	return -1
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+func (cp *CameraPeer) stopFaceIdentify() {
+	if cp.facePythonCmd == nil {
+		return
+	}
+	if cp.facePythonCmd.Process != nil {
+		_ = cp.facePythonCmd.Process.Kill()
+	}
+	_ = cp.facePythonCmd.Wait()
+	cp.facePythonCmd = nil
+}
+
+// waitFFmpegGone waits for the supervision goroutine to finish cmd.Wait after the process exits.
+func (cp *CameraPeer) waitFFmpegGone(d time.Duration) {
+	if cp.ffmpegWaitDone == nil {
+		return
+	}
+	select {
+	case <-cp.ffmpegWaitDone:
+	case <-time.After(d):
+	}
+}
+
+// restartFFmpeg restarts FFmpeg with new quality settings
+func (cp *CameraPeer) restartFFmpeg() {
+	cp.restartMu.Lock()
+	defer cp.restartMu.Unlock()
+
+	// Prevent multiple concurrent restarts
+	if cp.restartingFFmpeg {
+		return
+	}
+
+	if cp.shuttingDown {
+		return
+	}
+
+	cp.restartingFFmpeg = true
+	defer func() {
+		cp.restartingFFmpeg = false
+	}()
+
+	log.Printf("🔄 Restarting FFmpeg")
+
+	cp.stopFaceIdentify()
+
+	// Wait a moment before restart to allow pipes to settle
+	time.Sleep(2 * time.Second)
+
+	closePipes := func() {
+		if cp.videoPipe != nil {
+			cp.videoPipe.Close()
+			cp.videoPipe = nil
+		}
+		if cp.audioPipe != nil {
+			cp.audioPipe.Close()
+			cp.audioPipe = nil
+		}
+		if cp.facePipe != nil {
+			cp.facePipe.Close()
+			cp.facePipe = nil
+		}
+	}
+
+	// Terminate current FFmpeg process
+	if cp.ffmpegCmd != nil && cp.ffmpegCmd.Process != nil && cp.ffmpegRunning {
+		if err := cp.ffmpegCmd.Process.Kill(); err != nil {
+			log.Printf("Failed to kill FFmpeg process: %v", err)
+		}
+	}
+
+	closePipes()
+
+	// Wait for supervision goroutine's Wait() to finish after kill
+	if cp.ffmpegWaitDone != nil {
+		select {
+		case <-cp.ffmpegWaitDone:
+		case <-time.After(10 * time.Second):
+			log.Printf("FFmpeg process did not exit within 10s after kill")
+		}
+	}
+
+	// Additional wait to ensure complete cleanup
+	time.Sleep(2 * time.Second)
+
+	// Restart FFmpeg with new settings
+	if err := cp.startDualFFmpeg(); err != nil {
+		log.Printf("Failed to restart FFmpeg: %v", err)
+	} else {
+		log.Printf("FFmpeg restarted successfully with new quality settings")
+	}
+}
+
+// filterBinaryData removes non-printable characters from FFmpeg output
+func filterBinaryData(data string) string {
+	var result strings.Builder
+	for _, r := range data {
+		if r >= 32 && r <= 126 || r == '\n' || r == '\r' || r == '\t' {
+			result.WriteRune(r)
+		} else {
+			result.WriteRune('.')
+		}
+	}
+	return result.String()
+}
+
+// logRateLimited logs errors with deduplication to prevent screen flooding
+func (cp *CameraPeer) logRateLimited(message string, _ time.Duration) {
+	cp.lastErrorMu.Lock()
+	defer cp.lastErrorMu.Unlock()
+
+	if cp.lastErrorTime == nil {
+		cp.lastErrorTime = make(map[string]ErrorInfo)
+	}
+
+	info, exists := cp.lastErrorTime[message]
+	if !exists {
+		// First occurrence - log immediately
+		log.Printf(message)
+		cp.lastErrorTime[message] = ErrorInfo{
+			LastMessage: message,
+		}
+		return
+	}
+
+	// If this is the same as the last logged message, ignore it
+	if info.LastMessage == message {
+		return
+	}
+
+	// Different message - log it and update
+	log.Printf(message)
+	info.LastMessage = message
+	cp.lastErrorTime[message] = info
+}
+
+// isEncoderAvailable checks if FFmpeg encoder is available
+func isEncoderAvailable(encoder string) bool {
+	cmd := exec.Command("ffmpeg", "-hide_banner", "-encoders")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("Failed to get FFmpeg encoder list: %v", err)
+		return false
+	}
+
+	return strings.Contains(string(output), encoder)
 }
 
 // getICEConfiguration returns WebRTC ICE configuration from config
@@ -192,6 +462,269 @@ func getICEConfiguration() webrtc.Configuration {
 	}
 
 	return webrtc.Configuration{ICEServers: iceServers}
+}
+
+// validateInputDevices validates that input devices are available
+func (cp *CameraPeer) validateInputDevices() error {
+	// Validate video device
+	if err := cp.validateVideoDevice(); err != nil {
+		return fmt.Errorf("Video validate %v", err)
+	}
+
+	// Validate audio device if enabled
+	if cp.audioEnabled {
+		if err := cp.validateAudioDevice(); err != nil {
+			cp.audioEnabled = false
+			return fmt.Errorf("Audio validate %v, disabling audio", err)
+		}
+	}
+
+	cp.currentQuality = findMatchingQuality()
+	return nil
+}
+
+// validateVideoDevice checks if video device is available and generates quality levels
+func (cp *CameraPeer) validateVideoDevice() error {
+	if cp.videoDevice == "" {
+		return fmt.Errorf("video device not specified")
+	}
+
+	// Get actual device capabilities
+	capabilities, err := getDeviceCapabilities(cp.videoDevice)
+	if err != nil {
+		return fmt.Errorf("failed to get video device capabilities: %w", err)
+	}
+
+	// Update cameraQualities based on actual device capabilities
+	updateCameraQualities(capabilities)
+
+	// Reset currentQuality to highest quality (index 0) after dynamic generation
+	cp.qualityMu.Lock()
+	cp.currentQuality = 0
+	cp.qualityMu.Unlock()
+
+	log.Printf("Video device '%s' validated with %d supported resolutions", cp.videoDevice, len(capabilities.SupportedResolutions))
+	return nil
+}
+
+// getDeviceCapabilities retrieves actual device capabilities using FFmpeg list_options
+func getDeviceCapabilities(deviceName string) (*DeviceCapabilities, error) {
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("ffmpeg", "-hide_banner", "-list_options", "true", "-f", "dshow", "-i", fmt.Sprintf("video=%s", deviceName))
+	} else {
+		cmd = exec.Command("ffmpeg", "-hide_banner", "-f", "v4l2", "-list_formats", "all", "-i", fmt.Sprintf("%s", deviceName))
+	}
+
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+	// FFmpeg returns error even when successful, check output for device info
+	if err != nil {
+		// Check if we actually got device capabilities despite the error
+		if strings.Contains(outputStr, "DirectShow video device options") ||
+			strings.Contains(outputStr, "pixel_format=") {
+			// We got the device info, so ignore the error and continue
+			log.Printf("Device capabilities found despite FFmpeg error, continuing...")
+		} else if strings.Contains(outputStr, "Could not find video device") {
+			return nil, fmt.Errorf("device '%s' not found", deviceName)
+		} else {
+			// Some other error occurred
+			return nil, fmt.Errorf("failed to get device capabilities: %v", err)
+		}
+	}
+
+	capabilities := &DeviceCapabilities{
+		SupportedResolutions: []VideoCapability{},
+	}
+
+	// Parse FFmpeg output for supported resolutions
+	lines := strings.Split(outputStr, "\n")
+
+	resolutionMap := make(map[VideoCapability]bool)
+
+	for _, line := range lines {
+		if strings.Contains(line, "vcodec=") && strings.Contains(line, "min s=") && strings.Contains(line, "fps=") {
+			// Parse vcodec format: vcodec=mjpeg  min s=1280x720 fps=30 max s=1280x720 fps=30
+			vcodecMatch := regexp.MustCompile(`vcodec=(\w+)  min s=(\d+)x(\d+) fps=(\d+)`).FindStringSubmatch(line)
+			if len(vcodecMatch) >= 5 {
+				vcodec := vcodecMatch[1]
+				width, _ := strconv.Atoi(vcodecMatch[2])
+				height, _ := strconv.Atoi(vcodecMatch[3])
+				fps, _ := strconv.Atoi(vcodecMatch[4])
+
+				cap := VideoCapability{
+					VCodec:      vcodec,
+					PixelFormat: "", // No pixel format for vcodec entries
+					Width:       width,
+					Height:      height,
+					FPS:         fps,
+				}
+
+				if !resolutionMap[cap] {
+					resolutionMap[cap] = true
+					capabilities.SupportedResolutions = append(capabilities.SupportedResolutions, cap)
+				}
+			}
+		} else if strings.Contains(line, "pixel_format=") && strings.Contains(line, "min s=") && strings.Contains(line, "fps=") {
+			// Parse pixel format: pixel_format=yuyv422  min s=1280x720 fps=10 max s=1280x720 fps=10
+			pixelMatch := regexp.MustCompile(`pixel_format=(\w+)  min s=(\d+)x(\d+) fps=(\d+)`).FindStringSubmatch(line)
+			if len(pixelMatch) >= 5 {
+				pixelFormat := pixelMatch[1]
+				width, _ := strconv.Atoi(pixelMatch[2])
+				height, _ := strconv.Atoi(pixelMatch[3])
+				fps, _ := strconv.Atoi(pixelMatch[4])
+
+				cap := VideoCapability{
+					VCodec:      "",
+					PixelFormat: pixelFormat,
+					Width:       width,
+					Height:      height,
+					FPS:         fps,
+				}
+
+				if !resolutionMap[cap] {
+					resolutionMap[cap] = true
+					capabilities.SupportedResolutions = append(capabilities.SupportedResolutions, cap)
+				}
+			}
+		}
+	} // Added missing closing brace here
+
+	if len(capabilities.SupportedResolutions) == 0 {
+		return nil, fmt.Errorf("no supported resolutions found for device '%s'", deviceName)
+	}
+
+	log.Printf("Device capabilities for '%s': %+v", deviceName, capabilities.SupportedResolutions)
+	return capabilities, nil
+}
+
+// updateCameraQualities updates camera quality levels based on actual device capabilities
+func updateCameraQualities(capabilities *DeviceCapabilities) {
+	// Group by resolution and keep only preferred format for each
+	resolutionMap := make(map[string]VideoCapability) // key: "widthxheight"
+
+	for _, cap := range capabilities.SupportedResolutions {
+		format := cap.VCodec
+		if format == "" {
+			format = cap.PixelFormat
+		}
+		key := fmt.Sprintf("%dx%d@%d(%s)", cap.Width, cap.Height, cap.FPS, format)
+
+		// If no entry for this resolution yet, add it
+		if _, exists := resolutionMap[key]; !exists {
+			resolutionMap[key] = cap
+		}
+	}
+
+	// Convert map back to slice and sort by resolution
+	var filteredCaps []VideoCapability
+	for _, cap := range resolutionMap {
+		filteredCaps = append(filteredCaps, cap)
+	}
+
+	sort.Slice(filteredCaps, func(i, j int) bool {
+		// Sort by resolution (highest to lowest)
+		if filteredCaps[i].Width != filteredCaps[j].Width {
+			return filteredCaps[i].Width > filteredCaps[j].Width
+		}
+		return filteredCaps[i].Height > filteredCaps[j].Height
+	})
+
+	// Generate quality levels based on actual capabilities
+	cameraQualities = []CameraQuality{}
+	for _, cap := range filteredCaps {
+		// Skip very low resolutions
+		if cap.Width < 320 || cap.Height < 240 {
+			continue
+		}
+
+		// Calculate bitrate based on resolution and FPS
+		bitrate := calculateBitrate(cap.Width, cap.Height, cap.FPS)
+		format := cap.VCodec
+		if format == "" {
+			format = cap.PixelFormat
+		}
+
+		name := fmt.Sprintf("%dx%d@%d(%s)", cap.Width, cap.Height, cap.FPS, format)
+
+		cameraQualities = append(cameraQualities, CameraQuality{
+			Width:   cap.Width,
+			Height:  cap.Height,
+			FPS:     cap.FPS,
+			Bitrate: bitrate,
+			Format:  format,
+			Name:    name,
+		})
+	}
+
+	log.Printf("Updated camera quality levels: %+v", cameraQualities)
+}
+
+// calculateBitrate calculates appropriate bitrate based on resolution and FPS
+func calculateBitrate(width, height, fps int) string {
+	// Calculate base bitrate using industry-standard formulas
+	// For H.264: 0.1-0.2 bits per pixel per frame for good quality
+	pixels := width * height
+	baseBitrate := pixels * fps / 50 // Adjusted for cleaner numbers
+
+	// Round to nearest 100k for clean values
+	if baseBitrate >= 1000000 {
+		// Round to nearest 0.5M for high bitrates
+		megabits := float64(baseBitrate) / 1000000
+		rounded := math.Round(megabits*2) / 2 // Round to nearest 0.5
+		return fmt.Sprintf("%.1fM", rounded)
+	} else if baseBitrate >= 100000 {
+		// Round to nearest 100k
+		hundredK := math.Round(float64(baseBitrate)/100000) * 100000
+		return fmt.Sprintf("%.0fk", hundredK/1000)
+	} else {
+		// Round to nearest 10k for low bitrates
+		tenK := math.Round(float64(baseBitrate)/10000) * 10000
+		return fmt.Sprintf("%.0fk", tenK/1000)
+	}
+}
+
+// validateAudioDevice checks if audio device is available
+func (cp *CameraPeer) validateAudioDevice() error {
+	if config.AudioDevice == "" {
+		return fmt.Errorf("audio device not specified")
+	}
+
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("ffmpeg", "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy")
+	} else {
+		cmd = exec.Command("ffmpeg", "-hide_banner", "-f", "pulse", "-list_devices", "true", "-i", "dummy")
+	}
+
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+
+	// Parse device list from FFmpeg output
+	if runtime.GOOS == "windows" {
+		// Look for device in the dshow output format: "Device Name" (audio)
+		lines := strings.Split(outputStr, "\n")
+		for _, line := range lines {
+			if strings.Contains(line, config.AudioDevice) && strings.Contains(line, "(audio)") {
+				log.Printf("Audio device '%s' found", config.AudioDevice)
+				return nil
+			}
+		}
+		return fmt.Errorf("audio device '%s' not found in device list", config.AudioDevice)
+	} else {
+		// Linux pulse validation
+		if err != nil {
+			// Check if the error contains device information
+			if strings.Contains(outputStr, config.AudioDevice) {
+				log.Printf("Audio device '%s' found", config.AudioDevice)
+				return nil
+			}
+			return fmt.Errorf("audio device '%s' not found: %v", config.AudioDevice, err)
+		}
+	}
+
+	log.Printf("Audio device '%s' validated successfully", config.AudioDevice)
+	return nil
 }
 
 // loadConfig loads configuration from JSON file and applies CLI overrides
@@ -222,9 +755,13 @@ func loadConfig(configPath string, overrides map[string]string) error {
 		case "VideoDevice":
 			config.VideoDevice = value
 			log.Printf("Override VideoDevice: %s", value)
-		case "VideoCodec":
-			config.VideoCodec = value
-			log.Printf("Override VideoCodec: %s", value)
+		case "Encoder":
+			if !isEncoderAvailable(value) {
+				return fmt.Errorf("encoder %s not available\n"+
+					"Run `ffmpeg -hide_banner -encoders` to find the appropriate gpu/cpu encoder you'd like to use", value)
+			}
+			config.Encoder = value
+			log.Printf("Override Encoder: %s", value)
 		case "VideoWidth":
 			if width, err := strconv.Atoi(value); err == nil {
 				config.VideoWidth = width
@@ -243,22 +780,34 @@ func loadConfig(configPath string, overrides map[string]string) error {
 		case "VideoBitrate":
 			config.VideoBitrate = value
 			log.Printf("Override VideoBitrate: %s", value)
+		case "VideoFormat":
+			config.VideoFormat = value
+			log.Printf("Override VideoFormat: %s", value)
 		case "FaceRecogEnabled":
 			if enabled, err := strconv.ParseBool(value); err == nil {
 				config.FaceRecogEnabled = enabled
 				log.Printf("Override FaceRecogEnabled: %v", enabled)
 			}
 		case "FaceRecogFormat":
-			config.FaceRecogFormat = value
+			config.FaceRecogFormat = strings.TrimSpace(value)
 			log.Printf("Override FaceRecogFormat: %s", value)
 		case "FaceRecogPipe":
 			config.FaceRecogPipe = value
 			log.Printf("Override FaceRecogPipe: %s", value)
-		case "TestPipeOnly":
-			if testOnly, err := strconv.ParseBool(value); err == nil {
-				config.TestPipeOnly = testOnly
-				log.Printf("Override TestPipeOnly: %v", testOnly)
+		case "AudioDevice":
+			config.AudioDevice = value
+			log.Printf("Override AudioDevice: %s", value)
+		case "AudioBitrate":
+			config.AudioBitrate = value
+			log.Printf("Override AudioBitrate: %s", value)
+		case "GPUAcceleration":
+			if enabled, err := strconv.ParseBool(value); err == nil {
+				config.GPUAcceleration = enabled
+				log.Printf("Override GPUAcceleration: %v", enabled)
 			}
+		case "FFmpegLogFile":
+			config.FFmpegLogFile = filepath.ToSlash(value)
+			log.Printf("Override FFmpegLogFile: %s", value)
 		}
 	}
 
@@ -275,16 +824,18 @@ Required:
 Options:
   -config string      Path to config JSON file
   -c, -config string Path to config JSON file (shorthand)
+  -log string         FFmpeg report file (sets FFREPORT; see FFmpeg docs: file=NAME:level=N)
   -C, -config-key   Set config value (can be used multiple times)
                       Format: -C key=value
-                      Available keys: SignalingServerURL, StunServerURL, CameraName, VideoDevice, VideoCodec, VideoWidth, VideoHeight, VideoFPS, VideoBitrate, FaceRecogEnabled, FaceRecogFormat, FaceRecogPipe, TestPipeOnly
+                      Available keys: SignalingServerURL, StunServerURL, CameraName, VideoDevice, AudioDevice, Encoder, VideoWidth, VideoHeight, VideoFPS, VideoBitrate, VideoFormat, AudioBitrate, FaceRecogEnabled, FaceRecogFormat, FaceRecogPipe, TestPipeOnly, GPUAcceleration, GPUDevice, FFmpegLogFile
   -h, -help         Show this help
 
 Examples:
   %s -room=123
   %s -room=123 -c config.json
   %s -room=123 -C VideoDevice=/dev/video0 -C FaceRecogEnabled=true
-`, os.Args[0], os.Args[0], os.Args[0])
+  %s -room=123 -log ffmpeg.log
+`, os.Args[0], os.Args[0], os.Args[0], os.Args[0])
 }
 
 func main() {
@@ -292,10 +843,12 @@ func main() {
 	var configPath string
 	var configKeys arrayFlags
 	var showHelp bool
+	var ffmpegLogFile string
 
 	flag.StringVar(&roomID, "room", "", "Room ID to join")
 	flag.StringVar(&configPath, "config", "", "Path to config JSON file")
 	flag.StringVar(&configPath, "c", "", "Path to config JSON file (shorthand)")
+	flag.StringVar(&ffmpegLogFile, "log", "", "FFmpeg FFREPORT log file path (basename written under that file's directory)")
 	flag.Var(&configKeys, "C", "Set config value (key=value)")
 	flag.Var(&configKeys, "config-key", "Set config value (key=value)")
 	flag.BoolVar(&showHelp, "help", false, "Show help")
@@ -323,7 +876,11 @@ func main() {
 	}
 
 	if err := loadConfig(configPath, overrides); err != nil {
-		log.Printf("Config error: %v", err)
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
+	if ffmpegLogFile != "" {
+		config.FFmpegLogFile = filepath.ToSlash(ffmpegLogFile)
+		log.Printf("Using -log for FFmpeg FFREPORT file: %s", config.FFmpegLogFile)
 	}
 
 	// Now check for required room ID after config is loaded
@@ -332,7 +889,6 @@ func main() {
 	}
 
 	log.Printf("Starting camera stream for room: %s", roomID)
-	log.Printf("Video device: %s", config.VideoDevice)
 	log.Printf("Face recognition enabled: %v", config.FaceRecogEnabled)
 	log.Printf("Signaling server: %s", config.SignalingServerURL)
 
@@ -340,10 +896,16 @@ func main() {
 		roomID:           roomID,
 		viewers:          make(map[string]bool),
 		stopCh:           make(chan struct{}),
-		videoInput:       config.VideoDevice,
-		audioEnabled:     false, // TODO: add audio support
+		videoDevice:      config.VideoDevice,
+		audioEnabled:     true,
 		faceRecogEnabled: config.FaceRecogEnabled,
 		lastPersonCount:  -1,
+		currentQuality:   -1,
+		restartingFFmpeg: false,
+	}
+
+	if err := peer.validateInputDevices(); err != nil {
+		log.Fatalf("Error: %v", err)
 	}
 
 	// Handle shutdown gracefully
@@ -361,7 +923,7 @@ func main() {
 		if peer.ffmpegCmd != nil && peer.ffmpegCmd.Process != nil {
 			log.Println("Terminating FFmpeg process...")
 			peer.ffmpegCmd.Process.Kill()
-			peer.ffmpegCmd.Wait()
+			peer.waitFFmpegGone(5 * time.Second)
 		}
 
 		close(peer.stopCh)
@@ -398,6 +960,56 @@ func (cp *CameraPeer) joinRoom() error {
 	return cp.ws.WriteJSON(msg)
 }
 
+func createSharedTracks(cp *CameraPeer) error {
+	var initErr error
+
+	cp.tracksOnce.Do(func() {
+		// Create video track (H.264 for H.264 mode, VP8 for IVF)
+		var videoTrack *webrtc.TrackLocalStaticSample
+		if cp.h264Mode {
+			videoTrack, initErr = webrtc.NewTrackLocalStaticSample(
+				webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264},
+				"video",
+				"camera-video",
+			)
+		} else {
+			videoTrack, initErr = webrtc.NewTrackLocalStaticSample(
+				webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8},
+				"video",
+				"camera-video",
+			)
+		}
+
+		if initErr != nil {
+			return
+		}
+
+		cp.videoTrack = videoTrack
+		if _, initErr = cp.pc.AddTrack(videoTrack); initErr != nil {
+			return
+		}
+
+		// Create audio track if enabled
+		if cp.audioEnabled {
+			audioTrack, initErr := webrtc.NewTrackLocalStaticSample(
+				webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
+				"audio",
+				"camera-audio",
+			)
+			if initErr != nil {
+				return
+			}
+			cp.audioTrack = audioTrack
+
+			if _, initErr = cp.pc.AddTrack(audioTrack); initErr != nil {
+				return
+			}
+		}
+	})
+
+	return initErr
+}
+
 // createPeerConnection creates WebRTC peer connection
 func (cp *CameraPeer) createPeerConnection() error {
 	iceConfig := getICEConfiguration()
@@ -409,36 +1021,10 @@ func (cp *CameraPeer) createPeerConnection() error {
 
 	cp.pc = pc
 
-	// Create video track (VP8)
-	videoTrack, err := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8},
-		"video",
-		"camera-video",
-	)
-	if err != nil {
-		return err
-	}
-	cp.videoTrack = videoTrack
-
-	if _, err = pc.AddTrack(videoTrack); err != nil {
-		return err
-	}
-
-	// Create audio track if enabled
-	if cp.audioEnabled && cp.audioFile != "" {
-		audioTrack, err := webrtc.NewTrackLocalStaticSample(
-			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
-			"audio",
-			"camera-audio",
-		)
-		if err != nil {
-			return err
-		}
-		cp.audioTrack = audioTrack
-
-		if _, err = pc.AddTrack(audioTrack); err != nil {
-			return err
-		}
+	// Create video track (H.264 for H.264 mode, VP8 for IVF)
+	createErr := createSharedTracks(cp)
+	if createErr != nil {
+		return createErr
 	}
 
 	// Handle incoming tracks
@@ -514,7 +1100,7 @@ func (cp *CameraPeer) handleSignaling() {
 			if cp.ffmpegCmd != nil && cp.ffmpegCmd.Process != nil {
 				log.Println("Terminating FFmpeg process...")
 				cp.ffmpegCmd.Process.Kill()
-				cp.ffmpegCmd.Wait()
+				cp.waitFFmpegGone(10 * time.Second)
 			}
 			close(cp.stopCh)
 			return
@@ -568,12 +1154,43 @@ func (cp *CameraPeer) handleUserLeft(userID string) {
 	log.Printf("User left: %s", userID)
 	cp.viewersMu.Lock()
 	delete(cp.viewers, userID)
+	noViewers := len(cp.viewers) == 0
 	cp.viewersMu.Unlock()
+
+	// One PeerConnection can only pair with one remote answer. When the last viewer leaves,
+	// close and recreate so the next viewer gets fresh ICE/SDP instead of stale candidates
+	// and duplicate answers from the client hitting an already-stable PC.
+	if noViewers {
+		cp.resetPeerForNextViewer()
+	}
+}
+
+// resetPeerForNextViewer closes the current PC and builds a new one (same media tracks for FFmpeg).
+func (cp *CameraPeer) resetPeerForNextViewer() {
+	cp.webrtcMu.Lock()
+	defer cp.webrtcMu.Unlock()
+	if cp.pc == nil {
+		return
+	}
+	log.Println("All viewers left; resetting WebRTC peer connection for next join")
+	_ = cp.pc.Close()
+	cp.pc = nil
+	if err := cp.createPeerConnection(); err != nil {
+		log.Printf("Failed to recreate peer connection: %v", err)
+	}
 }
 
 // sendOffer creates and sends WebRTC offer to a viewer
 func (cp *CameraPeer) sendOffer(viewerID string) {
 	log.Printf("Sending offer to viewer: %s", viewerID)
+
+	cp.webrtcMu.Lock()
+	defer cp.webrtcMu.Unlock()
+
+	if cp.pc == nil {
+		log.Printf("Skipping offer to %s: no peer connection", viewerID)
+		return
+	}
 
 	offer, err := cp.pc.CreateOffer(nil)
 	if err != nil {
@@ -599,13 +1216,26 @@ func (cp *CameraPeer) sendOffer(viewerID string) {
 
 // handleAnswer processes answer from viewer
 func (cp *CameraPeer) handleAnswer(msg SignalingMessage) {
-	log.Printf("Received answer from viewer")
-
 	if msg.Answer == nil {
 		log.Println("Answer is nil")
 		return
 	}
 
+	cp.webrtcMu.Lock()
+	defer cp.webrtcMu.Unlock()
+
+	if cp.pc == nil {
+		return
+	}
+
+	// Clients often deliver the same answer twice (e.g. mobile + strict effects). Applying a
+	// second answer while already stable triggers: stable -> SetRemote(answer) -> invalid.
+	if cp.pc.SignalingState() != webrtc.SignalingStateHaveLocalOffer {
+		log.Printf("Ignoring duplicate or late answer (signaling state is %s)", cp.pc.SignalingState().String())
+		return
+	}
+
+	log.Printf("Received answer from viewer")
 	if err := cp.pc.SetRemoteDescription(*msg.Answer); err != nil {
 		log.Printf("Failed to set remote description: %v", err)
 	}
@@ -614,6 +1244,13 @@ func (cp *CameraPeer) handleAnswer(msg SignalingMessage) {
 // handleCandidate processes ICE candidate from viewer
 func (cp *CameraPeer) handleCandidate(msg SignalingMessage) {
 	if msg.Candidate == nil {
+		return
+	}
+
+	cp.webrtcMu.Lock()
+	defer cp.webrtcMu.Unlock()
+
+	if cp.pc == nil {
 		return
 	}
 
@@ -649,165 +1286,359 @@ func (cp *CameraPeer) Run() error {
 
 	// Cleanup temporary files
 	if cp.faceRecogEnabled {
-		// Ensure FFmpeg is terminated before cleanup
+		cp.stopFaceIdentify()
 		if cp.ffmpegCmd != nil && cp.ffmpegCmd.Process != nil {
 			log.Println("Terminating FFmpeg process...")
 			cp.ffmpegCmd.Process.Kill()
-			cp.ffmpegCmd.Wait()
 		}
+		cp.waitFFmpegGone(10 * time.Second)
 
-		// Give FFmpeg more time to release the file
 		time.Sleep(1 * time.Second)
-		tempFile := "face_recog_frames.raw"
-		if err := os.Remove(tempFile); err != nil && !os.IsNotExist(err) {
-			log.Printf("Failed to remove temp file %s: %v", tempFile, err)
-		} else {
-			log.Printf("Successfully removed temp file %s", tempFile)
+		if cp.faceRecogFile != "" {
+			if err := os.Remove(cp.faceRecogFile); err != nil && !os.IsNotExist(err) {
+				cp.logRateLimited(fmt.Sprintf("Failed to remove temp file %s: %v", cp.faceRecogFile, err), 10*time.Second)
+			} else {
+				log.Printf("Successfully removed temp file %s", cp.faceRecogFile)
+			}
 		}
 	}
 
 	return nil
 }
 
-// startDualFFmpeg launches FFmpeg with tee filter for dual output
-func (cp *CameraPeer) startDualFFmpeg() error {
-	log.Println("Starting FFmpeg with dual pipe output...")
+// getGPUDeviceParam returns the appropriate GPU device parameter
+func getGPUDeviceParam() string {
+	if config.GPUAcceleration {
+		// Specific GPU device requested
+		if runtime.GOOS == "windows" {
+			return "-gpu"
+		} else if runtime.GOOS == "linux" {
+			return "-vaapi_device"
+		}
+		return ""
+	}
+	return ""
+}
 
-	// Build FFmpeg command with tee filter
-	var ffmpegArgs []string
+// startDualFFmpeg launches one FFmpeg process with multiple linear outputs (no filter_complex):
+// (1) WebRTC video to stdout (H.264 Annex-B or IVF), (2) optional rawvideo file for face recognition,
+// (3) optional Opus to pipe:2.
+func (cp *CameraPeer) startDualFFmpeg() error {
+	cp.stopFaceIdentify()
+
+	log.Println("Starting FFmpeg (multi-output: WebRTC stdout, optional face raw file, optional audio pipe:2)...")
+
+	format := cameraQualities[cp.currentQuality].Format
+	encoder := config.Encoder
+	cp.h264Mode = strings.Contains(encoder, "h264") || encoder == "libx264"
+
+	log.Printf("Video mode: %s", func() string {
+		if cp.h264Mode {
+			return "H.264"
+		}
+		return "IVF (VP8)"
+	}())
+
+	cp.faceRecogFile = ""
+	facePixFmt := config.FaceRecogFormat
+	if strings.TrimSpace(facePixFmt) == "" {
+		facePixFmt = DefaultFaceRecogFormat
+	}
+
+	videoArgs := []string{
+		"-hide_banner",
+		"-thread_queue_size", "1024",
+		"-f", "dshow",
+		"-video_size", fmt.Sprintf("%dx%d", config.VideoWidth, config.VideoHeight),
+		"-rtbufsize", "64M",
+	}
+	if format == "nv12" || format == "yuyv422" {
+		videoArgs = append(videoArgs, "-pixel_format", format)
+	} else if format == "h264" || format == "mjpeg" {
+		videoArgs = append(videoArgs, "-vcodec", format)
+	}
+	videoArgs = append(videoArgs, "-i", fmt.Sprintf("video=%s", cp.videoDevice))
 
 	if runtime.GOOS == "windows" {
-		if cp.faceRecogEnabled {
-			// Windows: Use file for face recognition (fallback from named pipe)
-			tempFile := "face_recog_frames.raw"
-			ffmpegArgs = []string{
+		if cp.audioEnabled {
+			videoArgs = append(videoArgs,
+				"-thread_queue_size", "1024",
 				"-f", "dshow",
-				"-i", fmt.Sprintf("video=%s", cp.videoInput),
-				"-rtbufsize", "64M",
-				"-thread_queue_size", "1024",
-				"-filter_complex", fmt.Sprintf(
-					"split=2[v1][v2];[v1]copy[v1out];[v2]scale=%d:%d:flags=fast_bilinear,format=%s,fps=5[v2out]",
-					320, 320, cp.getFaceFormat()),
-				"-map", "[v1out]",
-				"-c:v", config.VideoCodec,
-				"-b:v", config.VideoBitrate,
-				"-maxrate", "1.5M",
-				"-bufsize", "2M",
-				"-g", "30",
-				"-keyint_min", "30",
-				"-f", "ivf", "pipe:1",
-				"-map", "[v2out]",
-				"-f", "rawvideo", tempFile,
-			}
-			log.Printf("Using file for face recognition: %s", tempFile)
-			// Start frame reader that reads from the file
-			go cp.readFrameFile(tempFile)
-		} else {
-			// Windows: Only output IVF for WebRTC (no face recognition)
-			ffmpegArgs = []string{
-				"-f", "dshow",
-				"-i", fmt.Sprintf("video=%s", cp.videoInput),
-				"-rtbufsize", "64M",
-				"-thread_queue_size", "1024",
-				"-c:v", config.VideoCodec,
-				"-b:v", config.VideoBitrate,
-				"-maxrate", "1.5M",
-				"-bufsize", "2M",
-				"-g", "30",
-				"-keyint_min", "30",
-				"-f", "ivf", "pipe:1",
-			}
+				"-i", fmt.Sprintf("audio=%s", config.AudioDevice),
+			)
 		}
-	} else {
-		// Linux/Unix: Use file for face recognition (same approach as Windows)
-		if cp.faceRecogEnabled {
-			tempFile := "face_recog_frames.raw"
-			ffmpegArgs = []string{
-				"-f", "v4l2",
-				"-i", cp.videoInput,
-				"-rtbufsize", "64M",
-				"-thread_queue_size", "1024",
-				"-filter_complex", fmt.Sprintf(
-					"split=2[v1][v2];[v1]copy[v1out];[v2]scale=%d:%d:flags=fast_bilinear,format=%s,fps=5[v2out]",
-					320, 320, cp.getFaceFormat()),
-				"-map", "[v1out]",
-				"-c:v", config.VideoCodec,
-				"-b:v", config.VideoBitrate,
-				"-maxrate", "1.5M",
-				"-bufsize", "2M",
-				"-g", "30",
-				"-keyint_min", "30",
-				"-f", "ivf", "pipe:1",
-				"-map", "[v2out]",
-				"-f", "rawvideo", tempFile,
-			}
-			log.Printf("Using file for face recognition: %s", tempFile)
-			// Start frame reader that reads from the file
-			go cp.readFrameFile(tempFile)
-		} else {
-			// Linux: Only output IVF for WebRTC (no face recognition)
-			ffmpegArgs = []string{
-				"-f", "v4l2",
-				"-i", cp.videoInput,
-				"-rtbufsize", "64M",
-				"-thread_queue_size", "1024",
-				"-c:v", config.VideoCodec,
-				"-b:v", config.VideoBitrate,
-				"-maxrate", "1.5M",
-				"-bufsize", "2M",
-				"-g", "30",
-				"-keyint_min", "30",
-				"-f", "ivf", "pipe:1",
-			}
-		}
+	} else if cp.audioEnabled {
+		videoArgs = append(videoArgs,
+			"-thread_queue_size", "1024",
+			"-f", "pulse",
+			"-i", config.AudioDevice,
+		)
 	}
+
+	gpuParam := ""
+	if config.GPUAcceleration {
+		gpuParam = getGPUDeviceParam()
+		log.Printf("(GPU: %v), GPU parameter: %s\n", config.GPUAcceleration, gpuParam)
+	}
+
+	if gpuParam != "" && config.GPUAcceleration {
+		videoArgs = append(videoArgs, gpuParam, config.GPUDevice)
+	}
+
+	var outputs []string
+
+	// (A) WebRTC video → stdout (H.264 elementary stream or IVF; never rawvideo+copy)
+	if encoder == "copy" && cp.h264Mode {
+		outputs = append(outputs,
+			"-map", "0:v",
+			"-c:v", "copy",
+			"-bsf:v", "h264_mp4toannexb",
+			"-f", "h264", "-",
+		)
+	} else if cp.h264Mode {
+		outputs = append(outputs,
+			"-map", "0:v",
+			"-c:v", encoder,
+			"-preset", "ultrafast",
+			"-crf", "18", // High baseline quality
+			"-b:v", config.VideoBitrate,
+			"-maxrate", "2M", // Strict ceiling for network constraints
+			"-bufsize", "2M", // 1-second buffer window for rate control
+			"-g", "30", // Keyframe every 30 frames (1s) for fast WebRTC recovery
+			"-pix_fmt", "yuv420p", // Required format for WebRTC compatibility
+			"-tune", "zerolatency",
+			"-f", "h264", "-",
+		)
+	} else {
+		outputs = append(outputs,
+			"-map", "0:v",
+			"-c:v", encoder,
+			"-preset", "ultrafast",
+			"-crf", "18",
+			"-b:v", config.VideoBitrate,
+			"-maxrate", "2M",
+			"-bufsize", "2M",
+			"-g", "30",
+			"-pix_fmt", "yuv420p",
+			"-f", "ivf", "-",
+		)
+	}
+
+	// (B) Face recognition: decoded raw video to disk (same input; not copy)
+	if cp.faceRecogEnabled {
+		currentDir, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("get working directory: %w", err)
+		}
+		storeFile := filepath.Join(currentDir, "pipe", "face_recog_frames.raw")
+		if err := os.MkdirAll(filepath.Dir(storeFile), 0755); err != nil {
+			return fmt.Errorf("create pipe directory: %w", err)
+		}
+		absFace, err := filepath.Abs(filepath.FromSlash(storeFile))
+		if err != nil {
+			absFace = filepath.FromSlash(storeFile)
+		}
+		cp.faceRecogFile = absFace
+		outputs = append(outputs,
+			"-map", "0:v",
+			"-f", "rawvideo",
+			"-pix_fmt", facePixFmt,
+			absFace,
+		)
+		log.Printf("Face recognition raw frames: %s (pix_fmt=%s)", absFace, facePixFmt)
+	}
+
+	// (C) Audio → temp file (Opus)
+	if cp.audioEnabled {
+		audioTemp, err := os.CreateTemp("", "webrtc_audio_*.opus")
+		if err != nil {
+			return fmt.Errorf("create temp audio file: %w", err)
+		}
+		cp.audioTempFile = audioTemp.Name()
+		audioTemp.Close()
+		outputs = append(outputs,
+			"-map", "1:a",
+			"-c:a", "libopus",
+			"-b:a", config.AudioBitrate,
+			"-minrate", "32k",
+			"-maxrate", "64k",
+			"-ar", "48000",
+			"-ac", "1",
+			"-f", "opus", cp.audioTempFile,
+		)
+	}
+
+	ffmpegArgs := append([]string{"-y"}, append(videoArgs, outputs...)...)
+	log.Printf("FFmpeg encoder (video): %s", encoder)
 
 	cp.ffmpegCmd = exec.Command("ffmpeg", ffmpegArgs...)
 
-	// Get stdout pipe for IVF
-	ivfPipe, err := cp.ffmpegCmd.StdoutPipe()
+	videoPipe, err := cp.ffmpegCmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("failed to create IVF pipe: %w", err)
+		return fmt.Errorf("failed to create video pipe: %w", err)
 	}
-	cp.ivfPipe = ivfPipe
+	cp.videoPipe = videoPipe
 
-	// Get stderr pipe
-	stderrPipe, err := cp.ffmpegCmd.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create stderr pipe: %w", err)
-	}
-	go func() {
-		scanner := bufio.NewScanner(stderrPipe)
-		for scanner.Scan() {
-			log.Printf("[FFmpeg stderr] %s", scanner.Text())
+	if config.FFmpegLogFile != "" {
+		logPath := filepath.Clean(config.FFmpegLogFile)
+		absLog, err := filepath.Abs(logPath)
+		if err != nil {
+			absLog = logPath
 		}
-	}()
+		logDir := filepath.Dir(absLog)
+		logBase := filepath.Base(absLog)
+		cp.ffmpegCmd.Dir = logDir
+		// FFREPORT syntax: file=FILENAME:level=N (basename avoids ':' in Windows paths being parsed as level)
+		cp.ffmpegCmd.Env = append(os.Environ(), fmt.Sprintf("FFREPORT=file=%s:level=32", logBase))
+	}
 
-	// Start FFmpeg
 	if err := cp.ffmpegCmd.Start(); err != nil {
+		if cp.audioPipe != nil {
+			_ = cp.audioPipe.Close()
+			cp.audioPipe = nil
+		}
+		_ = videoPipe.Close()
 		return fmt.Errorf("failed to start FFmpeg: %w", err)
 	}
 
+	waitDone := make(chan struct{})
+	cp.ffmpegWaitDone = waitDone
+	go func() {
+		defer close(waitDone)
+		err := cp.ffmpegCmd.Wait()
+		exitCode := 0
+		if err != nil {
+			var ee *exec.ExitError
+			if errors.As(err, &ee) {
+				exitCode = ee.ExitCode()
+			}
+		}
+		log.Printf("FFmpeg exited: exitCode=%d err=%v", exitCode, err)
+		cp.ffmpegRunning = false
+	}()
+
+	cp.ffmpegRunning = true
 	log.Printf("FFmpeg started with args: %v", ffmpegArgs)
 
-	// Start reading IVF from pipe for WebRTC
-	go cp.readIVFPipe()
+	if cp.h264Mode {
+		go cp.readH264Pipe()
+	} else {
+		go cp.readIVFPipe()
+	}
+
+	if cp.audioEnabled && cp.audioPipe != nil {
+		log.Println("Audio: starting Ogg Opus reader from FFmpeg pipe:3 (waits for WebRTC audio track)")
+		go cp.readOGGPipe()
+	}
+
+	if cp.faceRecogEnabled && cp.faceRecogFile != "" {
+		for attempt := 0; attempt < 50; attempt++ {
+			if _, err := os.Stat(cp.faceRecogFile); err == nil {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		cp.startFaceIdentifyJSONL(cp.faceRecogFile)
+	}
 
 	return nil
 }
 
-// getFaceFormat returns FFmpeg format string for face recognition
-func (cp *CameraPeer) getFaceFormat() string {
-	switch config.FaceRecogFormat {
-	case "gray":
-		return "gray"
-	case "rgb24":
-		return "rgb24"
-	case "yuv420p":
-		return "yuv420p"
-	default:
-		return "yuv420p"
+func (cp *CameraPeer) sendIdentificationData(persons []PersonInfo, timestamp int64) {
+	msg := SignalingMessage{
+		Type:      "identification_data",
+		Persons:   persons,
+		Timestamp: timestamp,
 	}
+	if err := cp.ws.WriteJSON(msg); err != nil {
+		log.Printf("Failed to send identification data: %v", err)
+	} else {
+		log.Printf("Sent identification data: %d person(s)", len(persons))
+	}
+}
+
+// startFaceIdentifyJSONL runs face_identify.py on the growing raw file and forwards JSON lines on the WebSocket.
+func (cp *CameraPeer) startFaceIdentifyJSONL(rawPath string) {
+	if cp.ws == nil {
+		return
+	}
+	faceFmt := config.FaceRecogFormat
+	if faceFmt == "" {
+		faceFmt = DefaultFaceRecogFormat
+	}
+
+	cmd := exec.Command(DefaultPythonCompiler, "-u", DefaultPythonScript,
+		"--input", rawPath,
+		"--format", faceFmt,
+		"--width", strconv.Itoa(config.VideoWidth),
+		"--height", strconv.Itoa(config.VideoHeight),
+	)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Printf("face identify: stdout pipe: %v", err)
+		return
+	}
+	cp.facePythonCmd = cmd
+	if err := cmd.Start(); err != nil {
+		log.Printf("face identify: start: %v", err)
+		cp.facePythonCmd = nil
+		return
+	}
+	go func() {
+		defer func() {
+			_ = cmd.Wait()
+			if cp.facePythonCmd == cmd {
+				cp.facePythonCmd = nil
+			}
+		}()
+		scanner := bufio.NewScanner(stdout)
+		buf := make([]byte, 0, 64*1024)
+		scanner.Buffer(buf, 4*1024*1024)
+		for scanner.Scan() {
+			select {
+			case <-cp.stopCh:
+				_ = cmd.Process.Kill()
+				return
+			default:
+			}
+			line := scanner.Bytes()
+			var payload struct {
+				Persons []struct {
+					Name       string  `json:"name"`
+					Confidence float64 `json:"confidence"`
+					Score      float64 `json:"score"`
+					Bbox       *BBox   `json:"bbox"`
+				} `json:"persons"`
+				Timestamp float64 `json:"timestamp"`
+			}
+			if err := json.Unmarshal(line, &payload); err != nil {
+				continue
+			}
+			if len(payload.Persons) == 0 {
+				continue
+			}
+			out := make([]PersonInfo, 0, len(payload.Persons))
+			for _, p := range payload.Persons {
+				conf := p.Confidence
+				if conf == 0 && p.Score != 0 {
+					conf = p.Score
+				}
+				out = append(out, PersonInfo{
+					Name:       p.Name,
+					Confidence: conf,
+					Bbox:       p.Bbox,
+				})
+			}
+			ts := int64(math.Round(payload.Timestamp * 1000))
+			if ts == 0 {
+				ts = time.Now().UnixMilli()
+			}
+			cp.sendIdentificationData(out, ts)
+		}
+		if err := scanner.Err(); err != nil {
+			log.Printf("face identify stdout: %v", err)
+		}
+	}()
 }
 
 // readIVFPipe reads IVF from FFmpeg stdout and sends to WebRTC
@@ -818,9 +1649,9 @@ func (cp *CameraPeer) readIVFPipe() {
 	// This will be set when we receive existing_users or user-joined events
 
 	// Create IVF reader from pipe
-	ivf, _, err := ivfreader.NewWith(cp.ivfPipe)
+	ivf, _, err := ivfreader.NewWith(cp.videoPipe)
 	if err != nil {
-		log.Printf("Failed to create IVF reader: %v", err)
+		log.Fatalf("Failed to create IVF reader: %v", err)
 		return
 	}
 
@@ -831,12 +1662,17 @@ func (cp *CameraPeer) readIVFPipe() {
 		frame, _, err := ivf.ParseNextFrame()
 		if err != nil {
 			if err == io.EOF {
-				log.Println("FFmpeg ended - restarting...")
-				// Restart FFmpeg if it crashes
-				cp.restartFFmpeg()
+				// Only restart if not shutting down
+				if !cp.shuttingDown {
+					log.Println("FFmpeg ended - restarting...")
+					// Restart FFmpeg if it crashes
+					cp.restartFFmpeg()
+				} else {
+					log.Println("FFmpeg ended during shutdown, not restarting")
+				}
 				continue
 			}
-			log.Printf("IVF parse error: %v", err)
+			cp.logRateLimited(fmt.Sprintf("IVF parse error: %v", err), 5*time.Second)
 			continue
 		}
 
@@ -857,23 +1693,22 @@ func (cp *CameraPeer) readIVFPipe() {
 	}
 }
 
-// readFrameFile reads raw frames from file for face recognition (Windows fallback)
-func (cp *CameraPeer) readFrameFile(filename string) {
-	log.Println("Starting frame file reader for face recognition")
+// readH264Pipe reads H.264 stream from FFmpeg stdout pipe and sends to WebRTC
+func (cp *CameraPeer) readH264Pipe() {
+	log.Println("Starting H.264 pipe reader for WebRTC")
 
-	frameSize := 320 * 320 * 3 // Default RGB24
-	switch config.FaceRecogFormat {
-	case "gray":
-		frameSize = 320 * 320 // Grayscale
-	case "rgb24":
-		frameSize = 320 * 320 * 3 // RGB24
-	case "yuv420p":
-		frameSize = 320 * 320 * 3 / 2 // YUV420 (1.5 bytes per pixel)
+	// Create H.264 reader from pipe
+	h264, err := h264reader.NewReader(cp.videoPipe)
+	if err != nil {
+		log.Fatalf("Failed to create H.264 reader: %v", err)
+		return
 	}
 
 	frameCount := 0
+	startTime := time.Now()
+	nextVideoSampleTime := time.Now()
+	timePerFrame := time.Millisecond * time.Duration(config.VideoFPS)
 
-	// Wait for file to be created and start reading
 	for {
 		select {
 		case <-cp.stopCh:
@@ -881,153 +1716,106 @@ func (cp *CameraPeer) readFrameFile(filename string) {
 		default:
 		}
 
-		// Open file and read from end (like tail -f)
-		file, err := os.Open(filename)
-		if err != nil {
-			if os.IsNotExist(err) {
-				// File not created yet, wait a bit
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-			log.Printf("Failed to open frame file: %v", err)
-			return
-		}
-
-		// Seek to end of file
-		stat, err := file.Stat()
-		if err != nil {
-			file.Close()
-			log.Printf("Failed to stat file: %v", err)
-			return
-		}
-
-		offset := stat.Size()
-		frameData := make([]byte, frameSize)
-
-		for {
-			// Read from current position
-			n, err := file.ReadAt(frameData, offset)
-			if err != nil && err != io.EOF {
-				log.Printf("Frame file read error: %v", err)
-				break
-			}
-
-			if n == frameSize {
-				// Store frame for face recognition (make a copy to avoid race condition)
-				frameCopy := make([]byte, frameSize)
-				copy(frameCopy, frameData)
-				cp.lastFrameMu.Lock()
-				cp.lastFrame = frameCopy
-				cp.lastFrameMu.Unlock()
-
-				frameCount++
-				if frameCount < 10 || frameCount%50 == 0 {
-					log.Printf("Face recognition: sent frame %d", frameCount)
-				}
-
-				offset += int64(frameSize)
-			} else if n == 0 {
-				// No new data, wait a bit
-				time.Sleep(50 * time.Millisecond)
+		nal, err := h264.NextNAL()
+		if err == io.EOF {
+			if !cp.shuttingDown {
+				log.Printf("H.264 pipe ended (%d frames in %.1fs) - restarting...", frameCount, time.Since(startTime).Seconds())
+				// Restart FFmpeg if it crashes
+				// cp.restartFFmpeg()
 			} else {
-				// Partial read, skip to next frame boundary
-				offset += int64(n)
+				log.Println("H.264 pipe ended during shutdown, not restarting")
 			}
+			return // restartFFmpeg should re-launch this goroutine
 		}
-
-		file.Close()
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-// readFramePipe reads raw frames for face recognition
-func (cp *CameraPeer) readFramePipe() {
-	log.Println("Starting frame pipe reader for face recognition")
-
-	var frameReader io.Reader
-
-	if runtime.GOOS == "windows" {
-		// Windows: Connect to named pipe
-		pipePath := `\\.\pipe\` + config.FaceRecogPipe
-		// Wait for pipe to be available
-		for i := 0; i < 30; i++ {
-			if conn, err := os.Open(pipePath); err == nil {
-				frameReader = conn
-				break
-			}
-			if i < 29 {
-				time.Sleep(time.Second)
-			}
-		}
-		if frameReader == nil {
-			log.Printf("Failed to connect to named pipe: %s", pipePath)
-			return
-		}
-	} else {
-		// Linux: Read from pipe:4 (this won't work directly, need different approach)
-		log.Println("Frame pipe reading not implemented for Linux - use separate FFmpeg instance")
-		return
-	}
-
-	frameSize := 320 * 320 * 3 // Default RGB24
-	switch config.FaceRecogFormat {
-	case "gray":
-		frameSize = 320 * 320 // Grayscale
-	case "rgb24":
-		frameSize = 320 * 320 * 3 // RGB24
-	case "yuv420p":
-		frameSize = 320 * 320 * 3 / 2 // YUV420 (1.5 bytes per pixel)
-	}
-
-	frameCount := 0
-	for {
-		frameData := make([]byte, frameSize)
-		n, err := io.ReadFull(frameReader, frameData)
 		if err != nil {
-			if err == io.EOF {
-				log.Println("Frame pipe ended")
+			cp.logRateLimited(fmt.Sprintf("H.264 NAL read error: %v", err), 5*time.Second)
+			continue
+		}
+
+		// Timing logic for smooth playback
+		// Golang's time.Sleep() is not precise enough for a consistent video stream
+		// (see https://github.com/golang/go/issues/44343). Instead, calculate the
+		// remaining sleep duration using wall clock time.
+		nextVideoSampleTime = nextVideoSampleTime.Add(timePerFrame)
+		if sleep := nextVideoSampleTime.Sub(time.Now()); sleep > 0 {
+			time.Sleep(sleep)
+		}
+
+		// Send to WebRTC track when ready
+		if cp.videoTrack != nil {
+			if err := cp.videoTrack.WriteSample(media.Sample{
+				Data:     nal.Data,
+				Duration: time.Second / time.Duration(config.VideoFPS),
+			}); err != nil {
+				log.Printf("Failed to write H.264 sample: %v", err)
 				return
 			}
-			log.Printf("Frame read error: %v", err)
-			continue
 		}
-
-		if n != frameSize {
-			log.Printf("Incomplete frame: %d/%d bytes", n, frameSize)
-			continue
-		}
-
-		// Store frame for face recognition (make a copy to avoid race condition)
-		frameCopy := make([]byte, frameSize)
-		copy(frameCopy, frameData)
-		cp.lastFrameMu.Lock()
-		cp.lastFrame = frameCopy
-		cp.lastFrameMu.Unlock()
 
 		frameCount++
-		if frameCount < 10 || frameCount%50 == 0 {
-			log.Printf("Face recognition: sent frame %d", frameCount)
+		if frameCount < 5 || frameCount%200 == 0 {
+			log.Printf("H.264: sent NAL unit %d (%.1fs elapsed)", frameCount, time.Since(startTime).Seconds())
 		}
 	}
 }
 
-// restartFFmpeg restarts the FFmpeg process
-func (cp *CameraPeer) restartFFmpeg() {
-	// Don't restart if shutting down
-	if cp.shuttingDown {
-		log.Println("Shutdown in progress, not restarting FFmpeg")
+// readFFmpegAudioOGG reads Opus-in-Ogg from FFmpeg (pipe:3 via ExtraFiles), same timing idea as laptop/main.go.
+func (cp *CameraPeer) readOGGPipe() {
+	waitUntil := time.Now().Add(2 * time.Minute)
+	for cp.audioTrack == nil && !cp.shuttingDown {
+		if time.Now().After(waitUntil) {
+			log.Println("Audio: no WebRTC audio track after 2m, exiting reader")
+			return
+		}
+		select {
+		case <-cp.stopCh:
+			log.Println("Audio: stop before track ready")
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if cp.audioTrack == nil {
+		return
+	}
+	ogg, _, err := oggreader.NewWith(cp.audioPipe)
+	if err != nil {
+		log.Printf("Audio: oggreader: %v", err)
 		return
 	}
 
-	if cp.ffmpegCmd != nil && cp.ffmpegCmd.Process != nil {
-		log.Println("Terminating existing FFmpeg process...")
-		cp.ffmpegCmd.Process.Kill()
-		cp.ffmpegCmd.Wait()
-	}
+	var lastGranule uint64
+	pageCount := 0
+	startTime := time.Now()
 
-	time.Sleep(2 * time.Second)
-
-	if err := cp.startDualFFmpeg(); err != nil {
-		log.Printf("Failed to restart FFmpeg: %v", err)
+	for {
+		select {
+		case <-cp.stopCh:
+			log.Println("Audio: stop signal, exiting reader")
+			return
+		default:
+		}
+		pageData, pageHeader, err := ogg.ParseNextPage()
+		if errors.Is(err, io.EOF) {
+			log.Printf("Audio: Opus stream EOF (%d pages in %.1fs)", pageCount, time.Since(startTime).Seconds())
+			return
+		}
+		if err != nil {
+			log.Printf("Audio: read Ogg page: %v", err)
+			return
+		}
+		sampleCount := float64(pageHeader.GranulePosition - lastGranule)
+		lastGranule = pageHeader.GranulePosition
+		sampleDuration := time.Duration((sampleCount/48000)*1000) * time.Millisecond
+		if err := cp.audioTrack.WriteSample(media.Sample{Data: pageData, Duration: sampleDuration}); err != nil {
+			log.Printf("Audio: WriteSample: %v", err)
+			return
+		}
+		if sampleDuration > 0 {
+			time.Sleep(sampleDuration)
+		}
+		pageCount++
+		if pageCount < 5 || pageCount%100 == 0 {
+			log.Printf("Audio: sent Ogg page %d (%.1fs elapsed)", pageCount, time.Since(startTime).Seconds())
+		}
 	}
 }

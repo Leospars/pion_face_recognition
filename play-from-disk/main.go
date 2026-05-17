@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 The Pion community <https://pion.ly>
 // SPDX-License-Identifier: MIT
 
-//go:build !js
+//go:build ignore
 
 // play-from-disk demonstrates how to send video and/or audio to your browser from files saved to disk.
 package main
@@ -25,9 +25,8 @@ import (
 )
 
 const (
-	audioFileName   = "output.ogg"
-	videoFileName   = "output.ivf"
-	oggPageDuration = time.Millisecond * 20
+	audioFileName = "output.ogg"
+	videoFileName = "output.ivf"
 )
 
 func main() { //nolint:gocognit,cyclop,gocyclo,maintidx
@@ -176,7 +175,7 @@ func main() { //nolint:gocognit,cyclop,gocyclo,maintidx
 	}
 
 	if haveAudioFile { //nolint:nestif
-		// Create a audio track
+		// Create an audio track
 		audioTrack, audioTrackErr := webrtc.NewTrackLocalStaticSample(
 			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus}, "audio", "pion",
 		)
