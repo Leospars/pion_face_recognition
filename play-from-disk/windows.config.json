@@ -1,0 +1,29 @@
+{
+  "cameraName": "lock_id_cam",
+  "signalingServerUrl": "ws://192.168.56.1:3000",
+  "videoDevice": "Arducam USB Camera",
+  "audioDevice": "Microphone (Arducam USB MIC)",
+  "videoWidth": 1280,
+  "videoHeight": 720,
+  "videoFPS": 30,
+  "videoFormat": "h264",
+  "encoder": "libvpx",
+  "videoBitrate": "1M",
+  "audioBitrate": "48k",
+  "faceRecogEnabled": true,
+  "faceRecogFormat": "yuyv422",
+  "gpuAcceleration": true,
+  "pythonCompiler": "../../face_recog/.venv/Scripts/python",
+  "faceRecogScript": "../face_recog_wrapper.py",
+  "iceCredentials": [
+    {
+      "urls": "stun:stun.l.google.com:19302"
+    },
+    {
+      "urls": "stun:stun1.l.google.com:19302"
+    },
+    {
+      "urls": "stun:stun.relay.metered.ca:80"
+    }
+  ]
+}

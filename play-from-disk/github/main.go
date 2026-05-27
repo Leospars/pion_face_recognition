@@ -25,8 +25,8 @@ import (
 )
 
 const (
-	audioFileName = "output.ogg"
-	videoFileName = "output.ivf"
+	audioFileName = "../output.ogg"
+	videoFileName = "../output.ivf"
 )
 
 func main() { //nolint:gocognit,cyclop,gocyclo,maintidx

@@ -11,11 +11,11 @@ from frame_pipe import read_frames as read_frames_from_pipe
 # -----------------------------
 # Configuration
 # -----------------------------
-FACE_DET_MODEL = "D:\\Code_Main\\Final_Year_Project\\SBC\\face_recog\\models\\face_detection_yunet_2023mar.onnx"
-FACE_REC_MODEL = "D:\\Code_Main\\Final_Year_Project\\SBC\\face_recog\\models\\mobileface_v1.0_infer.onnx"
+FACE_DET_MODEL = "D:/Code_Main/Final_Year_Project/SBC/face_recog/models/face_detection_yunet_2023mar.onnx"
+FACE_REC_MODEL = "D:/Code_Main/Final_Year_Project/SBC/face_recog/models/mobileface_v1.0_infer.onnx"
 IMAGE_SIZE = (320, 320)
-COSINE_THRESHOLD = 0.6   # higher = stricter
-KNOWN_FACES_DIR = "./known_faces"
+COSINE_THRESHOLD = 0.5   # higher = stricter
+KNOWN_FACES_DIR = "D:/Code_Main/Final_Year_Project/SBC/webrtc_video/known_faces"
 
 # -----------------------------
 # Mobile Face Recognizer Class
@@ -114,20 +114,27 @@ def extract_embedding_from_frame(frame):
 # -----------------------------
 # Build face database
 # -----------------------------
-def load_face_database(update=False):
+def load_face_database(update=False, face_db_dir = KNOWN_FACES_DIR):
     """Load known faces from database
         If update=True, recompute all images and save to centroid.npy
+
+    Directory layout expected:
+        face_db/
+          <person_id>/
+            gallery/          ← source images (only used when update=True)
+              *.png
+            centroid.npy      ← pre-computed mean embedding
     """
 
     face_db = {}
-    if not os.path.exists(KNOWN_FACES_DIR):
-        log.error(f"Faces database directory '{KNOWN_FACES_DIR}' not found")
+    if not os.path.exists(face_db_dir):
+        log.error(f"Faces database directory '{os.path.abspath(face_db_dir)}' not found")
         return face_db
 
-    for dir in os.listdir(KNOWN_FACES_DIR):
+    for dir in os.listdir(face_db_dir):
         name = dir
         face_db[name] = []
-        person_path = os.path.join(KNOWN_FACES_DIR, dir)
+        person_path = os.path.join(face_db_dir, dir)
 
         if update:
             gallery_path = os.path.join(person_path, "gallery")
@@ -143,7 +150,7 @@ def load_face_database(update=False):
                 np_arr = np.array(face_db[name])
                 centroid = np.mean(np_arr, axis=0)
                 # store embedding in directory
-                np.save(f"{KNOWN_FACES_DIR}/{dir}/centroid.npy", centroid)
+                np.save(f"{face_db_dir}/{dir}/centroid.npy", centroid)
 
         for file in os.listdir(person_path):
             if file.endswith("centroid.npy"):
@@ -156,7 +163,7 @@ def load_face_database(update=False):
 # ----------------------------------------------------
 # OPTION 2: Manual cosine similarity (RECOMMENDED)
 # ----------------------------------------------------
-def match_face(query_embedding, face_db=None):
+def match_face(query_embedding: np.ndarray, face_db=None):
     if face_db is None:
         face_db = globals().get('face_db', {})
     if len(face_db) == 0:
@@ -229,7 +236,7 @@ def process_frame(frame_data, detector: cv2.FaceDetectorYN, recognizer: MobileFa
                 name, score = match_face(embedding.flatten(), face_db)
                 # Add bounding box
                 x, y, w_box, h_box = face[:4].astype(int)
-                person = {"name": name, "score": score, "bbox": {"x": int(x), "y": int(y), "w": int(w_box), "h": int(h_box)}}
+                person = {"name": name, "confidence": float(score), "bbox": {"x": int(x), "y": int(y), "w": int(w_box), "h": int(h_box)}}
                 persons.append(person)
         rec_time = (time.time() - start_rec) * 1000.0
 
@@ -268,6 +275,7 @@ def main():
 
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
     DEFAULT_LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
+    global KNOWN_FACES_DIR
 
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument("-i", "--input", default="-")
@@ -278,12 +286,14 @@ def main():
     arg_parser.add_argument("--face-det-model", default=FACE_DET_MODEL)
     arg_parser.add_argument("--face-rec-model", default=FACE_REC_MODEL)
     arg_parser.add_argument("--update-face-db", action="store_true")
+    arg_parser.add_argument("--db", default=KNOWN_FACES_DIR)
+    arg_parser.add_argument("--display", action="store_true")
     args = arg_parser.parse_args()
 
     # Example terminal call
     # ffmpeg -hide_banner -f dshow -pixel_format yuyv422 -video_size 1920x1080 -rtbufsize 10M -i video="Arducam USB Camera" -f `
     # rawvideo -pix_fmt yuyv422 -r 5 pipe:1 | & "D:\Code_Main\Final_Year_Project\SBC\face_recog\.venv\Scripts\python.exe" -u `
-    # "d:\Code_Main\Final_Year_Project\SBC\webrtc_video\face_identify.py" --format "rgb24" --width 1920 --height 1080 --update-face-db
+    # "d:\Code_Main\Final_Year_Project\SBC\webrtc_video\face_identify.py" --format "rgb24" --width 1920 --height 1080
 
     """Main loop - process frames from ffmpeg stdin, write JSON to stdout"""
     # Initialize models
@@ -310,6 +320,7 @@ def main():
 
     detector = cv2.FaceDetectorYN.create(args.face_det_model, "", IMAGE_SIZE)
     recognizer = MobileFaceRecognizer(args.face_rec_model, use_gpu=False)  # Use CPU for stability
+    KNOWN_FACES_DIR = args.db
     face_db = load_face_database(args.update_face_db)
     if(len(face_db) == 0):
         log.error("No persons in database")
@@ -326,18 +337,18 @@ def main():
 
             result = {
                 "persons": persons,
-                "timestamp": float(time.time()) if persons else 0,
+                "timestamp": float(time.time()),
                 "det_time": float(det_time),
                 "rec_time": float(rec_time)
             }
-            log.info(json.dumps(result))
+            print(json.dumps(result), flush=True)
 
         except Exception as e:
             log.exception("Error processing frame", extra={"error": str(e)})
 
         return persons
 
-    read_frames_from_pipe(args.input, args.width, args.height, channels, True, lambda frame: process_frame_util(frame, detector, recognizer, face_db, perfLog))
+    read_frames_from_pipe(args.input, args.width, args.height, channels, args.display, lambda frame: process_frame_util(frame, detector, recognizer, face_db, perfLog))
     perfLog.close()
 
 if __name__ == "__main__":

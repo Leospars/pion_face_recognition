@@ -4,6 +4,9 @@ go.sum
 
 # Build files
 *.exe
+*.pyc
+*.log
+*.csv
 
 # video and audio files
 *.ogg

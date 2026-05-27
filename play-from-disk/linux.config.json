@@ -1,0 +1,30 @@
+{
+    "cameraName": "Lock_ID_SBC_CAM",
+    "signalingServerUrl": "ws://192.168.50.163:3000",
+    "videoDevice": "/dev/video0",
+    "faceDevice": "/dev/video2",
+    "audioDevice": "default",
+    "audioDevice2": "default",
+    "videoWidth": 640,
+    "videoHeight": 480,
+    "videoFps": 30,
+    "videoFormat": "yuyv422",
+    "encoder": "x264enc",
+    "videoBitrate": "1M",
+    "audioBitrate": "48k",
+    "faceRecogEnabled": true,
+    "faceRecogFormat": "yuyv422",
+    "faceRecogPipe": "face_recog_pipe",
+    "gpuAcceleration": false,
+    "ffmpegLogFile": "ffmpeg.log",
+    "pyCompiler": "/home/pi/jupy/webrtc_video/.venv/bin/python",
+    "pyScript": "/home/pi/jupy/webrtc_video/face_identify.py",
+    "iceCredentials": [
+        {
+            "urls": "stun:stun.l.google.com:19302"
+        },
+        {
+            "urls": "stun:stun1.l.google.com:19302"
+        }
+    ]
+}
