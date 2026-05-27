@@ -6,3 +6,4 @@ These are the successful changes.
 Working Changes:
 - Added automatic connection and webrtc handshake via the signalling server
 - Video in ivf and h264 format supported and opus (converted to .ogg) supported
+- Handles Reconnects and multiple users correctly without issues keeping all at the same pace.
