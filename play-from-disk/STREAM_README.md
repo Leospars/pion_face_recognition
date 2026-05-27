@@ -101,6 +101,10 @@ Camera Device → FFmpeg (tee filter) → [IVF pipe] + [Raw frame file]
 # List available cameras
 ffmpeg -list_devices true -f dshow -i dummy
 
+# list supported qualities
+ffmpeg -hide_banner -list_options true -f dshow -i video="video_device_name"  
+ffmpeg -hide_banner -list_options true -f dshow -i audio="audio_device_name"  
+
 # Start streaming with face recognition
 go run stream.go -room=test -C VideoDevice="USB2.0 HD UVC WebCam" -C FaceRecogEnabled=true
 
@@ -122,7 +126,212 @@ go run stream.go -room=hq -C VideoWidth=1920 -C VideoHeight=1080 -C VideoBitrate
 
 ## FFmpeg Integration
 
-### Dual Output Commands
+The stream.go application generates FFmpeg commands dynamically based on platform, codec selection, and face recognition mode. It supports two video codec modes: **IVF (VP8/VP9)** for cross-platform compatibility and **H.264** for lower bandwidth requirements.
+
+### Video Codec Comparison
+
+| Feature | IVF (VP8) | H.264 |
+|---------|-----------|--------|
+| **Format** | IVF container | Raw NAL stream |
+| **Bitrate** | ~1-2M for 720p@30fps | ~500k-1M for 720p@30fps |
+| **Compatibility** | Universal WebRTC | Most browsers/devices |
+| **Quality at same bitrate** | Excellent | Good |
+| **CPU Usage** | Higher | Lower |
+| **Best for** | Streaming servers | Mobile/embedded |
+
+### Adaptive Bitrate with CRF and VBR
+
+Stream.go uses two complementary rate control mechanisms:
+
+**CRF (Constant Rate Factor)**
+- Adjusts quality dynamically around a target bitrate
+- `-crf 23`: Quality level (0-51, lower = higher quality)
+- Lower values use more bandwidth, higher values reduce quality
+- Sweet spot: 18-28 for video streaming
+
+**VBR (Variable Bit Rate)**
+- Sets bitrate boundaries to prevent extremes
+- `-b:v 1M`: Target bitrate (1Mbps nominal)
+- `-minrate 500k`: Don't go below 500kbps (minimum quality)
+- `-maxrate 2M`: Don't exceed 2Mbps (bandwidth cap)
+- `-bufsize 2M`: Buffer size for rate control smoothing
+
+**Combined Effect**: Video maintains consistent quality while adapting to network conditions between min/max boundaries.
+
+### Platform & Mode Specific Commands
+
+#### 1. Windows with VP8/IVF + Face Recognition
+```powershell
+ffmpeg -y -f dshow -i video="USB2.0 HD UVC WebCam" -rtbufsize 64M -thread_queue_size 1024 `
+  -pixel_format nv12 `
+  -f dshow -i audio="Microphone" `
+  -filter_complex "split=2[v1][v2];[v1]copy[v1out];[v2]scale=320:320:flags=fast_bilinear,format=nv12,fps=5[v2out]" `
+  -map "[v1out]" -c:v libvpx -crf 23 -b:v 1M -minrate 500k -maxrate 2M -bufsize 2M -g 30 -keyint_min 30 -f ivf pipe:1 `
+  -map "[v2out]" -f rawvideo face_recog_frames.raw `
+  -map 1:a -c:a libopus -b:a 48k -minrate 32k -maxrate 64k -ar 48000 -ac 2 -f opus pipe:2
+```
+
+**What this does:**
+- Captures video from USB camera (dshow format)
+- Captures audio from microphone
+- Splits video into two streams using filter_complex
+- Stream 1: Full resolution, encoded as VP8 IVF to pipe:1 (WebRTC)
+- Stream 2: Scaled to 320x320 at 5 FPS, raw YUV420 to file (face recognition)
+- Audio: Encoded as Opus to pipe:2 (WebRTC)
+
+#### 2. Windows with H.264 + Face Recognition
+```powershell
+ffmpeg -y -f dshow -i video="USB2.0 HD UVC WebCam" -rtbufsize 64M -thread_queue_size 1024 \
+  -pixel_format nv12 \
+  -f dshow -i audio="Microphone" \
+  -filter_complex "split=2[v1][v2];[v1]copy[v1out];[v2]scale=320:320:flags=fast_bilinear,format=nv12,fps=5[v2out]" \
+  -map "[v1out]" -c:v libx264 -crf 23 -b:v 1M -minrate 500k -maxrate 2M -bufsize 2M -g 30 -keyint_min 30 -f h264 pipe:1 \
+  -map "[v2out]" -f rawvideo face_recog_frames.raw \
+  -map 1:a -c:a libopus -b:a 48k -minrate 32k -maxrate 64k -ar 48000 -ac 2 -f opus pipe:2
+```
+
+**What this does:**
+- Same capture as VP8 version, but uses libx264 H.264 encoder
+- H.264 format outputs raw NAL units (not wrapped in IVF container)
+- Lower bitrate requirement (~20% less bandwidth than VP8 at same quality)
+- Better compatibility with mobile and embedded devices
+
+#### 3. Linux with VP8/IVF + Face Recognition
+```bash
+ffmpeg -y -f v4l2 -i /dev/video0 -rtbufsize 64M -thread_queue_size 1024 \
+  -input_format nv12 \
+  -f pulse -i default \
+  -filter_complex "split=2[v1][v2];[v1]copy[v1out];[v2]scale=320:320:flags=fast_bilinear,format=nv12,fps=5[v2out]" \
+  -map "[v1out]" -c:v libvpx -crf 23 -b:v 1M -minrate 500k -maxrate 2M -bufsize 2M -g 30 -keyint_min 30 -f ivf pipe:1 \
+  -map "[v2out]" -f rawvideo face_recog_frames.raw \
+  -map 1:a -c:a libopus -b:a 48k -minrate 32k -maxrate 64k -ar 48000 -ac 2 -f opus pipe:2
+```
+
+**What this does:**
+- Captures from Linux V4L2 camera interface
+- Audio from PulseAudio (default device)
+- Input format preference: NV12 for efficiency
+- Same dual-stream split as Windows version
+- Output to pipes for cross-platform pipe handling
+
+#### 4. Linux with H.264 + Face Recognition
+```bash
+ffmpeg -y -f v4l2 -i /dev/video0 -rtbufsize 64M -thread_queue_size 1024 \
+  -input_format nv12 \
+  -f pulse -i default \
+  -filter_complex "split=2[v1][v2];[v1]copy[v1out];[v2]scale=320:320:flags=fast_bilinear,format=nv12,fps=5[v2out]" \
+  -map "[v1out]" -c:v libx264 -crf 23 -b:v 1M -minrate 500k -maxrate 2M -bufsize 2M -g 30 -keyint_min 30 -f h264 pipe:1 \
+  -map "[v2out]" -f rawvideo face_recog_frames.raw \
+  -map 1:a -c:a libopus -b:a 48k -minrate 32k -maxrate 64k -ar 48000 -ac 2 -f opus pipe:2
+```
+
+**What this does:**
+- Same V4L2 capture as VP8 version with H.264 encoding
+- Better for embedded systems and mobile streaming
+- Reduced bandwidth while maintaining good quality
+
+### Input Parameters Explained
+
+**Video Capture:**
+- `-y`: Overwrite output files without asking
+- `-f dshow` / `-f v4l2`: Input format (Windows DirectShow / Linux Video4Linux2)
+- `-i video="Camera_Name"` / `-i /dev/video0`: Video input device
+- `-rtbufsize 64M`: Real-time buffer size (64MB prevents frame drops on busy systems)
+- `-thread_queue_size 1024`: Queue size for input threads (higher = more memory, less frame drops)
+
+**Format Preferences:**
+- `-pixel_format nv12` (Windows dshow): Preferred camera output format
+- `-input_format nv12` (Linux v4l2): Preferred camera input format
+- NV12 is superior to YUYV422: same quality, 50% less bandwidth
+
+**Audio Input:**
+- `-f dshow` (Windows): DirectShow audio capture
+- `-f pulse` (Linux): PulseAudio capture
+- `-i "Microphone"` or `-i default`: Audio device selection
+
+### Video Encoding Parameters
+
+**Codec Selection:**
+- `-c:v libvpx`: VP8 encoder (IVF output)
+- `-c:v libvpx-vp9`: VP9 encoder (more efficient VP8)
+- `-c:v libx264`: H.264 encoder (best compatibility)
+- `-c:v h264_nvenc`: NVIDIA GPU acceleration (Windows/Linux)
+- `-c:v hevc_nvenc`: NVIDIA H.265 encoder (newer, smaller files)
+
+**Rate Control (CRF + VBR):**
+- `-crf 23`: Constant Rate Factor (quality: 0=lossless, 51=worst, 23=good balance)
+- `-b:v 1M`: Target bitrate (1Mbps)
+- `-minrate 500k`: Minimum bitrate floor (never drop below this quality)
+- `-maxrate 2M`: Maximum bitrate ceiling (never exceed this bandwidth)
+- `-bufsize 2M`: Encoder buffer size for rate control smoothing
+
+**Keyframe Control (critical for streaming):**
+- `-g 30`: GOP size - keyframe every 30 frames (1 sec at 30fps)
+- `-keyint_min 30`: Minimum keyframe interval
+- Keyframes required for: stream start, seeking, error recovery
+
+**Output Format:**
+- `-f ivf`: IVF container format (VP8/VP9 for WebRTC)
+- `-f h264`: Raw H.264 NAL units (not wrapped in container)
+- `pipe:1`: Output to stdout (pipe 1)
+
+### Face Recognition Stream Parameters
+
+**Filter Complex:**
+```
+split=2[v1][v2];[v1]copy[v1out];[v2]scale=320:320:flags=fast_bilinear,format=nv12,fps=5[v2out]
+```
+- `split=2[v1][v2]`: Split input into two independent streams
+- `[v1]copy[v1out]`: Stream 1 - copy unchanged (pass-through to WebRTC)
+- `[v2]scale=320:320`: Stream 2 - scale to 320x320 for face recognition
+- `flags=fast_bilinear`: Fast scaling algorithm (good quality/speed tradeoff)
+- `format=nv12`: Convert to NV12 format (efficient for face models)
+- `fps=5`: Reduce to 5 FPS (enough for face detection, saves CPU)
+
+**Output Mapping:**
+- `-map "[v1out]"`: Map stream 1 to main video output (WebRTC)
+- `-map "[v2out]"`: Map stream 2 to face recognition file
+- `-f rawvideo`: Output raw pixels (no container)
+- `face_recog_frames.raw`: File path (cross-platform compatible)
+
+### Audio Encoding Parameters
+
+**Codec and Basic Settings:**
+- `-c:a libopus`: Opus audio codec (best for VoIP/streaming)
+- `-b:a 48k`: Target audio bitrate (48kbps)
+- `-ar 48000`: Audio sample rate (48kHz, WebRTC standard)
+- `-ac 2`: Audio channels (stereo)
+
+**Adaptive Audio Bitrate:**
+- `-minrate 32k`: Minimum audio bitrate (lower quality for constrained bandwidth)
+- `-maxrate 64k`: Maximum audio bitrate (full quality)
+- Opus automatically adjusts between min/max based on content
+
+**Output:**
+- `-f opus`: Opus container format
+- `pipe:2`: Output to pipe 2 (stderr equivalent, separate from video pipe:1)
+
+### Pipe Outputs
+
+FFmpeg outputs to three locations simultaneously:
+
+1. **pipe:1** - Main video stream (to WebRTC)
+   - IVF or H.264 format
+   - Full resolution
+   - 30fps (configurable)
+
+2. **Face recognition file** - Secondary processed video
+   - Raw YUV420 pixel data
+   - Scaled to 320x320
+   - 5fps (independent of main stream)
+   - Suitable for machine learning models
+
+3. **pipe:2** - Audio stream (to WebRTC)
+   - Opus encoded
+   - 48kHz stereo
+   - Adaptive bitrate
+
+### Dual Output Commands (Legacy)
 
 **Windows (Named Pipes):**
 ```powershell
@@ -139,12 +348,6 @@ ffmpeg -f v4l2 -i /dev/video0 \
   -map "[v1out]" -c:v libvpx -b:v 1M -f ivf pipe:1 \
   -map "[v2out]" -f rawvideo pipe:4
 ```
-
-### Frame Format Options
-
-- **RGB24**: Full color frames (320x320x3 bytes)
-- **Grayscale**: Black and white frames (320x320 bytes)
-- **Frame Rate**: 5 FPS for face recognition (independent of WebRTC FPS)
 
 ## Face Recognition Testing
 

@@ -444,14 +444,25 @@ func isEncoderAvailable(encoder string) bool {
 
 // getICEConfiguration returns WebRTC ICE configuration from config
 func getICEConfiguration() webrtc.Configuration {
-	var iceServers []webrtc.ICEServer
+	iceServers := []webrtc.ICEServer{}
+	fmt.Println("ICE Credentials: ", config.ICECredentials)
 
 	for _, server := range config.ICECredentials {
-		iceServers = append(iceServers, webrtc.ICEServer{
-			URLs:       []string{server.URLs},
-			Username:   server.Username,
-			Credential: server.Credential,
-		})
+		// Only add TURN servers with credentials if they're provided
+		if server.Username != "" && server.Credential != "" {
+			iceServers = append(iceServers, webrtc.ICEServer{
+				URLs:       []string{server.URLs},
+				Username:   server.Username,
+				Credential: server.Credential,
+			})
+		} else if strings.HasPrefix(server.URLs, "stun:") || strings.HasPrefix(server.URLs, "stuns:") {
+			// Add STUN servers without credentials
+			iceServers = append(iceServers, webrtc.ICEServer{
+				URLs: []string{server.URLs},
+			})
+		} else {
+			log.Printf("Warning: Skipping TURN server because it is missing credentials: %s", server.URLs)
+		}
 	}
 
 	// Always add the default STUN server if no servers configured
@@ -460,6 +471,7 @@ func getICEConfiguration() webrtc.Configuration {
 			URLs: []string{config.StunServerURL},
 		})
 	}
+	fmt.Println("ICE Server: ", iceServers)
 
 	return webrtc.Configuration{ICEServers: iceServers}
 }

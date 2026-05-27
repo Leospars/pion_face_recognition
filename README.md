@@ -51,10 +51,10 @@ ffmpeg -i input.mp4 -c:v libx264 -f h264 - | ./webrtc_video -room=ROOM_ID -video
 First, list available devices:
 ```powershell
 # List video devices
-ffmpeg -list_devices true -f dshow -i dummy
+ffmpeg -hide_banner -list_devices true -f dshow -i dummy
 
 # List audio devices
-ffmpeg -list_devices true -f dshow -i dummy | findstr Audio
+ffmpeg -hide_banner -list_devices true -f dshow -i dummy | findstr Audio
 ```
 
 Then capture with ffmpeg (example with common device names):
